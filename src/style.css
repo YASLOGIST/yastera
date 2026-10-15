@@ -1,0 +1,548 @@
+:root {
+  --glass-bg: rgba(10, 12, 16, 0.55);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --text: rgba(236, 240, 246, 0.92);
+  --text-dim: rgba(236, 240, 246, 0.45);
+  --accent: #ff8a3d;
+  --live: #4ade80;
+  --font: ui-sans-serif, -apple-system, 'SF Pro Text', 'Inter', 'Segoe UI', system-ui, sans-serif;
+  --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: #000;
+  color: var(--text);
+  font-family: var(--font);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+#scene {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  outline: none;
+  touch-action: none;
+  cursor: grab;
+}
+
+#scene:active {
+  cursor: grabbing;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ---------- Loader ---------- */
+#loader {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  gap: 14px;
+  background: #000;
+  z-index: 20;
+  transition: opacity 900ms ease, visibility 900ms;
+}
+
+#loader.done {
+  opacity: 0;
+  visibility: hidden;
+}
+
+.loader-label {
+  font-size: 11px;
+  letter-spacing: 0.32em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.loader-track {
+  width: 180px;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.loader-bar {
+  height: 100%;
+  width: 0;
+  background: var(--text);
+  transition: width 240ms ease;
+}
+
+/* ---------- Top-right control pill ---------- */
+.hud-top {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 6px 5px 14px;
+  border-radius: 999px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  font-size: 12px;
+}
+
+.pill-label {
+  color: var(--text-dim);
+  letter-spacing: 0.04em;
+}
+
+.segmented {
+  display: flex;
+  padding: 2px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.segmented button,
+.icon-button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  cursor: pointer;
+  transition: background 160ms ease, color 160ms ease;
+}
+
+.segmented button {
+  padding: 4px 12px;
+  border-radius: 999px;
+}
+
+.segmented button[aria-checked='true'] {
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--text);
+}
+
+.segmented button:hover,
+.icon-button:hover {
+  color: var(--text);
+}
+
+.segmented button:focus-visible,
+.icon-button:focus-visible {
+  outline: 1px solid rgba(255, 255, 255, 0.5);
+  outline-offset: 1px;
+}
+
+.pill-divider {
+  width: 1px;
+  height: 16px;
+  background: var(--glass-border);
+}
+
+.icon-button {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+}
+
+.icon-button[aria-expanded='true'] {
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--text);
+}
+
+/* ---------- Studio panel (lil-gui) ---------- */
+.studio {
+  width: 284px;
+  max-height: calc(100vh - 90px);
+  overflow-y: auto;
+  border-radius: 14px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  scrollbar-width: thin;
+}
+
+.studio[hidden] {
+  display: none;
+}
+
+.studio .lil-gui {
+  --width: 284px;
+  --background-color: transparent;
+  --title-background-color: rgba(255, 255, 255, 0.03);
+  --widget-color: rgba(255, 255, 255, 0.08);
+  --hover-color: rgba(255, 255, 255, 0.14);
+  --focus-color: rgba(255, 255, 255, 0.2);
+  --number-color: #ffb27a;
+  --string-color: #9ad1ff;
+  --text-color: var(--text);
+  --title-text-color: var(--text);
+  --font-family: var(--font);
+  --font-size: 11.5px;
+  --input-font-size: 11.5px;
+  --padding: 5px;
+  --spacing: 5px;
+  --widget-height: 22px;
+  --name-width: 44%;
+  --slider-input-width: 30%;
+  --widget-border-radius: 4px;
+}
+
+.studio .lil-gui.root > .lil-title {
+  display: none;
+}
+
+/* ---------- Bottom-left telemetry ---------- */
+.hud-bottom {
+  position: fixed;
+  left: 22px;
+  bottom: 20px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  pointer-events: none;
+  user-select: none;
+}
+
+.readout {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+}
+
+.readout.dim {
+  color: var(--text-dim);
+}
+
+.mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--live);
+  box-shadow: 0 0 8px var(--live);
+}
+
+.dot.manual {
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+}
+
+/* ---------- Fatal error overlay ---------- */
+#fatal {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-content: center;
+  padding: 32px;
+  background: #000;
+  color: #ffb4a8;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  max-width: 100vw;
+}
+
+#fatal[hidden] {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .hud-top {
+    top: 12px;
+    right: 12px;
+  }
+  .hud-bottom {
+    left: 14px;
+    bottom: 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #loader,
+  .loader-bar {
+    transition: none;
+  }
+}
+
+/* ---------- City Navigation Ribbon ---------- */
+.city-nav {
+  position: fixed;
+  top: 18px;
+  left: 18px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: min(720px, calc(100vw - 260px));
+}
+
+.city-nav-title {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding-left: 4px;
+}
+
+.city-nav-scroll {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 4px;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  mask-image: linear-gradient(to right, black 85%, transparent 100%);
+}
+
+.city-nav-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.city-chip {
+  flex-shrink: 0;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 9999px;
+  background: var(--glass-bg);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid var(--glass-border);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 180ms ease;
+  user-select: none;
+}
+
+.city-chip:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.22);
+  transform: translateY(-1px);
+}
+
+.city-chip.active {
+  background: rgba(255, 138, 61, 0.20);
+  border-color: rgba(255, 138, 61, 0.60);
+  color: #fff;
+  box-shadow: 0 0 16px rgba(255, 138, 61, 0.25);
+}
+
+.city-chip-ar {
+  font-size: 11px;
+  opacity: 0.95;
+}
+
+.city-chip-en {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+/* ---------- City Telemetry Card ---------- */
+.city-card {
+  position: fixed;
+  left: 20px;
+  bottom: 64px;
+  z-index: 15;
+  width: min(380px, calc(100vw - 40px));
+  background: rgba(8, 10, 14, 0.78);
+  backdrop-filter: blur(28px) saturate(190%);
+  -webkit-backdrop-filter: blur(28px) saturate(190%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 14px;
+  padding: 18px 20px;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.65), 0 0 1px rgba(255, 255, 255, 0.25);
+  animation: cardIn 240ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+
+.city-card[hidden] {
+  display: none;
+}
+
+@keyframes cardIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.city-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 14px;
+}
+
+.city-card-badge {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+.city-card-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.city-card-sub {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-dim);
+}
+
+.city-card-close {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  transition: color 140ms ease;
+}
+
+.city-card-close:hover {
+  color: #fff;
+}
+
+.city-card-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 14px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.035);
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  margin-bottom: 12px;
+}
+
+.city-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.city-stat-label {
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.city-stat-val {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.city-card-desc {
+  margin: 0 0 12px 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: rgba(236, 240, 246, 0.78);
+}
+
+.city-card-landmarks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.city-landmark-chip {
+  font-size: 10px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: rgba(236, 240, 246, 0.85);
+}
+
+.city-card-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.btn-orbit {
+  flex: 1;
+  height: 32px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: all 180ms ease;
+}
+
+.btn-orbit:hover {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.32);
+  transform: translateY(-1px);
+}
+

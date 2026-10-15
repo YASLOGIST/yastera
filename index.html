@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="Physically based real-time orbital Earth simulation — NASA Blue Marble / Black Marble, GGX ocean glint, Rayleigh/Mie atmosphere." />
+    <title>Orbital Earth — Real-Time UTC</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <canvas id="scene" aria-label="Real-time rendering of planet Earth from orbit"></canvas>
+
+    <div id="loader" role="status" aria-live="polite">
+      <div class="loader-label">Acquiring orbit</div>
+      <div class="loader-track"><div class="loader-bar" id="loader-bar"></div></div>
+    </div>
+
+    <header class="hud-top" aria-label="Render controls">
+      <div class="pill" role="group" aria-label="Graphics quality">
+        <span class="pill-label">Graphics</span>
+        <div class="segmented" role="radiogroup" aria-label="Quality preset">
+          <button type="button" role="radio" data-quality="high" aria-checked="false">High</button>
+          <button type="button" role="radio" data-quality="ultra" aria-checked="true">Ultra</button>
+        </div>
+        <span class="pill-divider" aria-hidden="true"></span>
+        <button type="button" class="icon-button" id="studio-toggle" aria-expanded="false" aria-controls="studio" title="Studio controls">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <path fill="currentColor" d="M3 6h11.1a3 3 0 0 1 5.8 0H21v2h-1.1a3 3 0 0 1-5.8 0H3V6Zm14 2a1 1 0 1 0 0-2 1 1 0 0 0 0 2ZM3 16h1.1a3 3 0 0 1 5.8 0H21v2H9.9a3 3 0 0 1-5.8 0H3v-2Zm4 2a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z"/>
+          </svg>
+          <span class="visually-hidden">Studio controls</span>
+        </button>
+      </div>
+      <div id="studio" class="studio" hidden></div>
+    </header>
+
+    <nav class="city-nav" id="city-nav" aria-label="Global Cities Navigation">
+      <div class="city-nav-title">CITIES & HUBS</div>
+      <div class="city-nav-scroll" id="city-nav-scroll"></div>
+    </nav>
+
+    <article id="city-card" class="city-card" hidden aria-live="polite">
+      <div class="city-card-header">
+        <div>
+          <div class="city-card-badge" id="city-sector">SECTOR</div>
+          <h2 class="city-card-title">
+            <span id="city-name-ar">المدينة</span>
+            <span class="city-card-sub" id="city-name-en">City, Country</span>
+          </h2>
+        </div>
+        <button type="button" class="city-card-close" id="city-card-close" aria-label="Close city card">✕</button>
+      </div>
+
+      <div class="city-card-stats">
+        <div class="city-stat">
+          <span class="city-stat-label">COORDINATES</span>
+          <span class="city-stat-val mono" id="city-coords">—</span>
+        </div>
+        <div class="city-stat">
+          <span class="city-stat-label">POPULATION</span>
+          <span class="city-stat-val" id="city-pop">—</span>
+        </div>
+        <div class="city-stat">
+          <span class="city-stat-label">LOCAL TIME</span>
+          <span class="city-stat-val mono" id="city-time">—</span>
+        </div>
+        <div class="city-stat">
+          <span class="city-stat-label">SOLAR STATUS</span>
+          <span class="city-stat-val" id="city-sun">—</span>
+        </div>
+      </div>
+
+      <p class="city-card-desc" id="city-desc">—</p>
+      <div class="city-card-landmarks" id="city-landmarks"></div>
+
+      <div class="city-card-actions">
+        <button type="button" class="btn-orbit" id="btn-return-orbit">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="m15 9-6 6M9 9h6v6"/></svg>
+          العودة للمدار الكوكبي • Orbit View
+        </button>
+      </div>
+    </article>
+
+    <footer class="hud-bottom" aria-live="off">
+      <div class="readout"><span class="dot" id="mode-dot"></span><span id="mode-label">LIVE UTC</span></div>
+      <div class="readout mono" id="utc-label">—</div>
+      <div class="readout mono dim" id="subsolar-label">—</div>
+      <div class="readout mono dim" id="altitude-label">ALTITUDE 13,380 KM</div>
+      <div class="readout mono dim" id="fps-label"></div>
+    </footer>
+
+    <div id="fatal" role="alert" hidden></div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
