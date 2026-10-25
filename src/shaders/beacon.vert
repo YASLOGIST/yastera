@@ -1,3 +1,5 @@
+#include <common>
+#include <logdepthbuf_pars_vertex>
 // HDR orbital beacons — vertex stage (GL_POINTS).
 
 uniform float uSize;        // sprite size in world-ish units (scaled by 1/depth)
@@ -29,5 +31,6 @@ void main() {
 
   vec4 mvPosition = viewMatrix * worldPos;
   gl_Position = projectionMatrix * mvPosition;
+  #include <logdepthbuf_vertex>
   gl_PointSize = uSize * uPixelRatio / max(-mvPosition.z, 0.1);
 }

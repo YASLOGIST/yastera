@@ -3,35 +3,35 @@
     "file": "earth_day.jpg",
     "width": 4096,
     "height": 2048,
-    "bytes": 2826857,
-    "sha256": "20bf0fe0f6adb2a74b9755ed588a55d9f6572118ac4e201cbe126feb43e43836"
+    "bytes": 1647795,
+    "sha256": "a8ebbbcab74cf3845b8c9819915fcaf4096f3b744ff18efdfa5344740e035bc6"
   },
   {
     "file": "earth_night.jpg",
     "width": 4096,
     "height": 2048,
-    "bytes": 881956,
-    "sha256": "3263cfd8102c614a98a4ae67e0bf9e680f61295a11dceeb2c87a914e3671a9a7"
+    "bytes": 870873,
+    "sha256": "b7607178bf4349746dd0952c3bfc118f41b95ba43171562bafefa71d072b09ee"
   },
   {
     "file": "earth_specular.jpg",
     "width": 4096,
     "height": 2048,
-    "bytes": 1081490,
-    "sha256": "3fc5b2c42b6ac6bc9679d35fc899a4268e8053244d21593ee1fd24e4433564f2"
+    "bytes": 664634,
+    "sha256": "2cb2647f6ce6f30aa57a7e6566953013a6866be4498700a31e6f7d4653bf7014"
   },
   {
     "file": "earth_topology.jpg",
     "width": 4096,
     "height": 2048,
-    "bytes": 1168626,
-    "sha256": "898efacf4ad28d1ff6fe861650ab133eacfd356b073df7ad034a2e1b8221b034"
+    "bytes": 873253,
+    "sha256": "c48bf079c0051176e3f096fd7544d43019b486416249abe13e26ef1ecf5978be"
   },
   {
     "file": "earth_clouds.jpg",
     "width": 4096,
     "height": 2048,
-    "bytes": 2768114,
-    "sha256": "fc99101dc8eb3f42a2b3f981db17bf172768c491dcc660e9c5368e1224c872b0"
+    "bytes": 1636414,
+    "sha256": "251e911244f7d490160fc3823d55b0f849693a637f8f3c554040eeddd185b4c0"
   }
 ]

@@ -1,17 +1,24 @@
-// Background starfield — vertex stage. Fixed pixel size (no attenuation).
+#include <common>
+#include <logdepthbuf_pars_vertex>
+// Star field — vertex stage. Positions live on a huge sphere so the sky is
+// fixed in world space while the camera orbits.
 
 uniform float uPixelRatio;
-uniform float uTime;
+uniform float uSizeScale;
 
 in float aSize;
-in float aBrightness;
-in float aPhase;
+in float aMagnitude;
+in vec3  aColor;
 
-out float vBrightness;
+out vec3  vColor;
+out float vMagnitude;
 
 void main() {
-  vBrightness = aBrightness * (0.85 + 0.15 * sin(uTime * 0.9 + aPhase));
+  vColor = aColor;
+  vMagnitude = aMagnitude;
+
   vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
   gl_Position = projectionMatrix * mvPosition;
-  gl_PointSize = aSize * uPixelRatio;
+  #include <logdepthbuf_vertex>
+  gl_PointSize = aSize * uSizeScale * uPixelRatio;
 }

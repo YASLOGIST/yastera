@@ -1,3 +1,5 @@
+#include <common>
+#include <logdepthbuf_pars_vertex>
 // Shared vertex stage for the cloud shell and the atmosphere halo.
 
 out vec2 vUv;
@@ -12,4 +14,5 @@ void main() {
   vNormalW = normalize(mat3(modelMatrix) * normal);
   vCenterW = (modelMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
   gl_Position = projectionMatrix * viewMatrix * worldPos;
+  #include <logdepthbuf_vertex>
 }

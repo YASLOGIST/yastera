@@ -1,3 +1,5 @@
+#include <common>
+#include <logdepthbuf_pars_vertex>
 // Planetary surface — vertex stage.
 // Emits world-space position, geometric sphere normal and the MikkTSpace-style
 // tangent (from BufferGeometry.computeTangents) for tangent-space relief.
@@ -21,4 +23,5 @@ void main() {
   vTangentW = vec4(normalize(rot * tangent.xyz), tangent.w);
 
   gl_Position = projectionMatrix * viewMatrix * worldPos;
+  #include <logdepthbuf_vertex>
 }

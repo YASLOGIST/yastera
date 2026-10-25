@@ -49,7 +49,7 @@ export function createBeacons(pixelRatio, uSunDirection = null) {
 
   const points = new THREE.Points(geometry, material);
   points.name = 'orbitalBeacons';
-  points.renderOrder = 2;
+  points.renderOrder = 4;
   points.frustumCulled = false;
   return points;
 }

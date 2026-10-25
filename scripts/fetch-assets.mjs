@@ -1,21 +1,27 @@
 #!/usr/bin/env node
 /**
- * Deterministic NASA Earth & Bathymetric Texture Pipeline.
+ * Deterministic NASA Earth texture pipeline.
  *
- * Downloads and generates high-contrast Bathymetric Topographic ocean and
- * continental shelf maps matching cinema-grade orbital photography references:
- *   - Ocean abyss: rich deep navy blue (#051c33)
- *   - Mid-ocean ridges (Mid-Atlantic Ridge, East Pacific Rise): luminous ridge blue (#0e4f80)
- *   - Continental slopes & rifts (Red Sea rift): deep marine cyan (#157d9f)
- *   - Continental shelves (Persian Gulf, North Sea, Patagonia): vibrant cyan (#22b8cf)
- *   - Coastal shallows & barrier reefs (Bahamas, Great Barrier Reef): glowing turquoise (#3bc9db)
- *   - Continents: crisp 4K NASA Blue Marble albedo
- *   - Night side: Black Marble city lights on land + glowing ethereal turquoise shelves in ocean
- *   - Topology: continuous heightfield combining SRTM land mountains & seafloor bathymetric ridges
+ * Produces the five 4096x2048 equirectangular maps the renderer consumes:
+ *
+ *   earth_day.jpg       True-colour Blue Marble land albedo + neutral deep-water
+ *                       base. Deliberately *not* pre-shaded: relief lighting,
+ *                       aerial perspective and ocean optics are all solved per
+ *                       pixel in the surface shader, which is what keeps the
+ *                       planet from looking like a painted billboard.
+ *   earth_night.jpg     Black Marble city emission with the sensor's diffuse
+ *                       airglow floor removed (the raw mosaic carries a purple
+ *                       wash over every continent that reads as "fake").
+ *   earth_specular.jpg  Anti-aliased ocean mask (R = water).
+ *   earth_topology.jpg  Continuous height field: bathymetry in [15..85] grey
+ *                       levels, SRTM land elevation in [85..255].
+ *   earth_clouds.jpg    Cloud optical-density map (NASA cloud climatology),
+ *                       alpha-weighted so thin cirrus and dense cumulus both
+ *                       survive the JPEG round trip.
  *
  * Usage:
- *   node scripts/fetch-assets.mjs           # skip files that already validate
- *   node scripts/fetch-assets.mjs --force   # re-generate and re-download
+ *   node scripts/fetch-assets.mjs           # regenerate only what is missing
+ *   node scripts/fetch-assets.mjs --force   # rebuild every output
  */
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
@@ -30,63 +36,33 @@ const CACHE_DIR = path.join(OUT_DIR, '.cache');
 const FORCE = process.argv.includes('--force');
 const TIMEOUT_MS = 90_000;
 const ATTEMPTS_PER_SOURCE = 3;
-const JPEG_QUALITY = 92;
+
+const TARGET_W = 4096;
+const TARGET_H = 2048;
+
+// JPEG quality is a realism lever, not a size knob: low quality banding on
+// smooth ocean gradients is instantly visible at orbital scale.
+const Q_ALBEDO = 93;
+const Q_NIGHT = 95;
+const Q_MASK = 94;
+const Q_CLOUDS = 94;
 
 const THREE_PLANETS = 'https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/textures/planets';
 const THREE_GLOBE = 'https://unpkg.com/three-globe@2/example/img';
 const WEBGL_EARTH = 'https://raw.githubusercontent.com/turban/webgl-earth/master/images';
-const GLOBE_GL = 'https://unpkg.com/globe.gl/example';
 
-// NASA Visible Earth & ESD mirrors for high-res Blue Marble Topography & Bathymetry
-const NASA_BATHY_JULY_GSFC = 'https://eoimages.gsfc.nasa.gov/images/imagerecords/73000/73751/world.topo.bathy.200407.3x5400x2700.jpg';
-const NASA_BATHY_DEC_GSFC  = 'https://eoimages.gsfc.nasa.gov/images/imagerecords/73000/73909/world.topo.bathy.200412.3x5400x2700.jpg';
-const NASA_BATHY_JULY_ESD  = 'https://assets.science.nasa.gov/content/dam/science/esd/eo/images/bmng/bmng-topography-bathymetry/july/world.topo.bathy.200407.3x5400x2700.jpg';
+// NASA Visible Earth bathymetry (5400x2700 topo + bathy mosaic).
+const NASA_BATHY_JULY = 'https://eoimages.gsfc.nasa.gov/images/imagerecords/73000/73751/world.topo.bathy.200407.3x5400x2700.jpg';
+const NASA_BATHY_DEC = 'https://eoimages.gsfc.nasa.gov/images/imagerecords/73000/73909/world.topo.bathy.200412.3x5400x2700.jpg';
 
-// Real-world NASA Satellite Ocean Palette:
-//   - Abyssal Plains: Deep royal navy (#04152d)
-//   - Open Ocean: Rich oceanic navy blue (#082142)
-//   - Mid-Atlantic Ridge: Subtle deep oceanic blue (#0c2f5a)
-//   - Continental Slope: Marine blue (#124c82)
-//   - Continental Shelf (Gulf of Mexico, Grand Banks): Deep oceanic blue (#196fa8, NOT chalky cyan!)
-//   - Ultra-shallow tropical coral atolls & barrier reefs ONLY (Bahamas, Florida Keys): Delicate turquoise (#22a8bf)
-const COLOR_ABYSS   = [4, 21, 45];       // #04152d
-const COLOR_NAVY    = [8, 33, 66];       // #082142
-const COLOR_RIDGE   = [12, 47, 90];      // #0c2f5a
-const COLOR_SLOPE   = [18, 76, 130];     // #124c82
-const COLOR_SHELF   = [25, 111, 168];    // #196fa8 (Natural deep ocean blue)
-const COLOR_SHALLOW = [34, 168, 191];    // #22a8bf (Delicate tropical reef turquoise)
-
-function lerp(a, b, t) {
-  return a + (b - a) * Math.max(0, Math.min(1, t));
-}
-
-function lerpColor(c1, c2, t) {
-  return [
-    lerp(c1[0], c2[0], t),
-    lerp(c1[1], c2[1], t),
-    lerp(c1[2], c2[2], t),
-  ];
-}
-
-function evaluateBathyColor(normBathy) {
-  // normBathy: 0.0 (abyss) to 1.0 (shallow coast)
-  if (normBathy < 0.20) {
-    return lerpColor(COLOR_ABYSS, COLOR_NAVY, normBathy / 0.20);
-  } else if (normBathy < 0.50) {
-    return lerpColor(COLOR_NAVY, COLOR_RIDGE, (normBathy - 0.20) / 0.30);
-  } else if (normBathy < 0.75) {
-    return lerpColor(COLOR_RIDGE, COLOR_SLOPE, (normBathy - 0.50) / 0.25);
-  } else if (normBathy < 0.94) {
-    // Continental shelves remain natural deep oceanic blue, preventing cartoon cyan outlines
-    return lerpColor(COLOR_SLOPE, COLOR_SHELF, (normBathy - 0.75) / 0.19);
-  } else {
-    // Only ultra-shallow tropical coral atolls & reefs get delicate turquoise
-    return lerpColor(COLOR_SHELF, COLOR_SHALLOW, (normBathy - 0.94) / 0.06);
-  }
-}
+// Height-field convention shared by the pipeline and the surface shader.
+const HF_OCEAN_MIN = 15; // abyssal plain
+const HF_OCEAN_MAX = 85; // continental shelf break
+const HF_LAND_MIN = 85; // coastline
+const HF_LAND_MAX = 250; // 8 km peaks
 
 // ---------------------------------------------------------------------------
-// Image format helpers
+// Image helpers
 // ---------------------------------------------------------------------------
 const isJpeg = (b) => b.length > 4 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
 const isPng = (b) => b.length > 24 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
@@ -110,13 +86,88 @@ function probeImage(b) {
 function decodeBuffer(buf) {
   if (isPng(buf)) {
     const png = PNG.sync.read(buf);
-    return { width: png.width, height: png.height, data: png.data };
+    return { width: png.width, height: png.height, data: Buffer.from(png.data) };
   }
-  return jpeg.decode(buf, { useTArray: true, formatAsRGBA: true, maxMemoryUsageInMB: 2048, maxResolutionInMP: 200 });
+  const img = jpeg.decode(buf, {
+    useTArray: true,
+    formatAsRGBA: true,
+    maxMemoryUsageInMB: 4096,
+    maxResolutionInMP: 300,
+  });
+  return { width: img.width, height: img.height, data: Buffer.from(img.data) };
+}
+
+const clamp01 = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+const clamp255 = (x) => (x < 0 ? 0 : x > 255 ? 255 : x | 0);
+const lerp = (a, b, t) => a + (b - a) * clamp01(t);
+const smoothstep = (e0, e1, x) => {
+  const t = clamp01((x - e0) / (e1 - e0 || 1e-6));
+  return t * t * (3 - 2 * t);
+};
+const luma = (r, g, b) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+/** Bilinear sample of an RGBA image at normalised UV, returning linear-free 0..255. */
+function sampleBilinear(img, u, v, out) {
+  const x = clamp01(u) * (img.width - 1);
+  const y = clamp01(v) * (img.height - 1);
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const x1 = Math.min(img.width - 1, x0 + 1);
+  const y1 = Math.min(img.height - 1, y0 + 1);
+  const fx = x - x0;
+  const fy = y - y0;
+  const i00 = (y0 * img.width + x0) * 4;
+  const i10 = (y0 * img.width + x1) * 4;
+  const i01 = (y1 * img.width + x0) * 4;
+  const i11 = (y1 * img.width + x1) * 4;
+  const d = img.data;
+  for (let c = 0; c < 3; c += 1) {
+    const top = d[i00 + c] + (d[i10 + c] - d[i00 + c]) * fx;
+    const bottom = d[i01 + c] + (d[i11 + c] - d[i01 + c]) * fx;
+    out[c] = top + (bottom - top) * fy;
+  }
+  return out;
+}
+
+/**
+ * Separable box blur used to tame JPEG blocking on smooth ocean gradients and
+ * to widen the coastal shelf ramp without a hard edge.
+ */
+function boxBlur(src, width, height, radius, passes = 2) {
+  let a = Float32Array.from(src);
+  let b = new Float32Array(src.length);
+  const r = Math.max(1, radius | 0);
+  const norm = 1 / (2 * r + 1);
+  for (let p = 0; p < passes; p += 1) {
+    // horizontal
+    for (let y = 0; y < height; y += 1) {
+      const row = y * width;
+      let acc = 0;
+      for (let x = -r; x <= r; x += 1) acc += a[row + Math.min(width - 1, Math.max(0, x))];
+      for (let x = 0; x < width; x += 1) {
+        b[row + x] = acc * norm;
+        const add = a[row + Math.min(width - 1, x + r + 1)];
+        const sub = a[row + Math.max(0, x - r)];
+        acc += add - sub;
+      }
+    }
+    // vertical
+    for (let x = 0; x < width; x += 1) {
+      let acc = 0;
+      for (let y = -r; y <= r; y += 1) acc += b[Math.min(height - 1, Math.max(0, y)) * width + x];
+      for (let y = 0; y < height; y += 1) {
+        a[y * width + x] = acc * norm;
+        const add = b[Math.min(height - 1, y + r + 1) * width + x];
+        const sub = b[Math.max(0, y - r) * width + x];
+        acc += add - sub;
+      }
+    }
+  }
+  return a;
 }
 
 // ---------------------------------------------------------------------------
-// Network & Downloader
+// Network
 // ---------------------------------------------------------------------------
 async function download(url) {
   const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(TIMEOUT_MS) });
@@ -131,321 +182,512 @@ async function download(url) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const kb = (n) => `${(n / 1024).toFixed(0)} KB`;
-const sha = (b) => createHash('sha256').update(b).digest('hex');
+const mb = (n) => `${(n / 1024 / 1024).toFixed(1)} MB`;
 
 async function downloadCached(filename, sources, minBytes = 100_000) {
   const cachePath = path.join(CACHE_DIR, filename);
   try {
     const existing = await readFile(cachePath);
-    if (existing.length >= minBytes && probeImage(existing)) {
-      return existing;
-    }
+    if (existing.length >= minBytes && probeImage(existing)) return existing;
   } catch { /* missing or invalid */ }
 
   const errors = [];
   for (const src of sources) {
     for (let attempt = 1; attempt <= ATTEMPTS_PER_SOURCE; attempt += 1) {
       try {
-        console.log(`  ↓ Fetching ${filename} from ${src.note}...`);
+        console.log(`  ↓ ${filename} ← ${src.note}`);
         const raw = await download(src.url);
-        const info = probeImage(raw);
-        if (!info) throw new Error('Not an image');
+        if (!probeImage(raw)) throw new Error('Not a decodable image');
         if (raw.length < minBytes) throw new Error(`File too small: ${raw.length} bytes`);
         await writeFile(cachePath, raw);
         return raw;
       } catch (err) {
         errors.push(`${src.url} [attempt ${attempt}]: ${err.message || err}`);
-        if (attempt < ATTEMPTS_PER_SOURCE) await sleep(500 * attempt);
+        if (attempt < ATTEMPTS_PER_SOURCE) await sleep(400 * attempt);
       }
     }
   }
   throw new Error(`All sources failed for ${filename}:\n  ${errors.join('\n  ')}`);
 }
 
+/**
+ * The bathymetric half of the height field is stable across releases. When the
+ * NASA mirrors are unreachable we bootstrap from the previously generated
+ * earth_topology.jpg instead of failing the whole pipeline.
+ */
+async function seedCacheFromOutputs() {
+  const pairs = [['raw_heightfield.jpg', 'earth_topology.jpg'], ['raw_night_4096.jpg', 'earth_night.jpg']];
+  for (const [cacheName, outName] of pairs) {
+    const cachePath = path.join(CACHE_DIR, cacheName);
+    try {
+      await stat(cachePath);
+      continue;
+    } catch { /* seed it */ }
+    try {
+      const buf = await readFile(path.join(OUT_DIR, outName));
+      if (probeImage(buf)) await writeFile(cachePath, buf);
+    } catch { /* nothing to seed */ }
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Pipeline Main
+// Synthesis
 // ---------------------------------------------------------------------------
+async function buildSpecularMask(waterImg, specImg) {
+  const dst = Buffer.alloc(TARGET_W * TARGET_H * 4);
+  const tmp = new Float32Array(TARGET_W * TARGET_H);
+  const px = [0, 0, 0];
+
+  for (let y = 0; y < TARGET_H; y += 1) {
+    const v = y / (TARGET_H - 1);
+    for (let x = 0; x < TARGET_W; x += 1) {
+      const u = x / (TARGET_W - 1);
+      sampleBilinear(waterImg, u, v, px);
+      let water = px[0];
+      if (specImg) {
+        sampleBilinear(specImg, u, v, px);
+        // Marginal seas (Mediterranean, Red Sea, Persian Gulf, Caspian) are
+        // under-detected in the 4K mask; the 2K NASA specular map fills them.
+        water = Math.max(water, px[0]);
+      }
+      tmp[y * TARGET_W + x] = water / 255;
+    }
+  }
+
+  // One light blur kills single-pixel speckle, then a contrast curve re-sharpens
+  // the shoreline. Without this the mask bleeds a 3-4 km grey halo that reads as
+  // a glowing white-blue beach ring from orbit.
+  const blurred = boxBlur(tmp, TARGET_W, TARGET_H, 1, 1);
+  for (let i = 0; i < blurred.length; i += 1) {
+    const idx = i * 4;
+    const centred = smoothstep(0.30, 0.72, blurred[i]);
+    const v = clamp255(centred * 255);
+    dst[idx] = v;
+    dst[idx + 1] = v;
+    dst[idx + 2] = v;
+    dst[idx + 3] = 255;
+  }
+  const encoded = jpeg.encode({ width: TARGET_W, height: TARGET_H, data: dst }, Q_MASK);
+  return Buffer.from(encoded.data);
+}
+
+async function buildHeightField(heightFieldImg, srtmImg, waterMask) {
+  const dst = Buffer.alloc(TARGET_W * TARGET_H * 4);
+  const ocean = new Float32Array(TARGET_W * TARGET_H);
+  const land = new Float32Array(TARGET_W * TARGET_H);
+  const px = [0, 0, 0];
+
+  for (let y = 0; y < TARGET_H; y += 1) {
+    const v = y / (TARGET_H - 1);
+    for (let x = 0; x < TARGET_W; x += 1) {
+      const u = x / (TARGET_W - 1);
+      const idx = y * TARGET_W + x;
+      const isLand = waterMask[idx * 4] < 128;
+
+      sampleBilinear(heightFieldImg, u, v, px);
+      const hf = px[0];
+
+      if (isLand) {
+        let elevation = 0;
+        if (srtmImg) {
+          sampleBilinear(srtmImg, u, v, px);
+          elevation = px[0];
+        } else {
+          elevation = Math.max(0, hf - HF_LAND_MIN) * (HF_LAND_MAX - HF_LAND_MIN) / (255 - HF_LAND_MIN);
+        }
+        land[idx] = elevation;
+        ocean[idx] = HF_OCEAN_MAX;
+      } else {
+        // Depth from the bathymetric mosaic, normalised to the ocean band.
+        const depth = clamp01((hf - HF_OCEAN_MIN) / (HF_OCEAN_MAX - HF_OCEAN_MIN));
+        ocean[idx] = HF_OCEAN_MIN + depth * (HF_OCEAN_MAX - HF_OCEAN_MIN);
+        land[idx] = 0;
+      }
+    }
+  }
+
+  // Ocean depth is a smooth low-frequency field: blur it so JPEG block noise
+  // never shows up as contour bands through the deep-water shading.
+  const oceanSmooth = boxBlur(ocean, TARGET_W, TARGET_H, 2, 2);
+  const landSmooth = boxBlur(land, TARGET_W, TARGET_H, 1, 1);
+
+  for (let i = 0; i < TARGET_W * TARGET_H; i += 1) {
+    const water = waterMask[i * 4] / 255;
+    const oceanValue = oceanSmooth[i];
+    // Continuous shelf: land elevation starts exactly at the coastline value so
+    // the shader can derive a shoreline normal without a step discontinuity.
+    const landValue = HF_LAND_MIN + clamp01(landSmooth[i] / 255) * (HF_LAND_MAX - HF_LAND_MIN);
+    const value = clamp255(lerp(oceanValue, landValue, water * 0.0 + (1 - water)));
+    const idx = i * 4;
+    dst[idx] = value;
+    dst[idx + 1] = value;
+    dst[idx + 2] = value;
+    dst[idx + 3] = 255;
+  }
+
+  const encoded = jpeg.encode({ width: TARGET_W, height: TARGET_H, data: dst }, Q_MASK);
+  return Buffer.from(encoded.data);
+}
+
+/**
+ * Land albedo + neutral deep-water base.
+ *
+ * The previous pass painted a synthetic turquoise bathymetry palette into the
+ * map itself, which produced the "white-blue beach" halo and a cartoon ocean.
+ * Ocean colour is now pure shading; this map only needs a believable base tone.
+ */
+async function buildAlbedo(trueColorImg, waterMask) {
+  const dst = Buffer.alloc(TARGET_W * TARGET_H * 4);
+  const px = [0, 0, 0];
+
+  for (let y = 0; y < TARGET_H; y += 1) {
+    const v = y / (TARGET_H - 1);
+    for (let x = 0; x < TARGET_W; x += 1) {
+      const u = x / (TARGET_W - 1);
+      const idx = y * TARGET_W + x;
+      const water = waterMask[idx * 4] / 255;
+
+      if (water > 0.98) {
+        // Deep-water base: cool, very dark, no saturation so the shader's
+        // Fresnel sky reflection and sun glitter own the final look.
+        dst[idx * 4] = 9;
+        dst[idx * 4 + 1] = 21;
+        dst[idx * 4 + 2] = 34;
+        dst[idx * 4 + 3] = 255;
+        continue;
+      }
+
+      sampleBilinear(trueColorImg, u, v, px);
+      let r = px[0];
+      let g = px[1];
+      let b = px[2];
+
+      // Gentle vegetal / arid micro-vibrance. Deliberately mild: the previous
+      // pass pushed +14% green which made forests radioactive under bloom.
+      const maxc = Math.max(r, g, b);
+      const minc = Math.min(r, g, b);
+      const sat = maxc > 0 ? (maxc - minc) / maxc : 0;
+      if (sat > 0.05) {
+        if (g >= r && g >= b) {
+          r *= 0.985;
+          g *= 1.045;
+          b *= 0.975;
+        } else if (r > g && r > b) {
+          r *= 1.005;
+          g *= 0.995;
+          b *= 0.975;
+        }
+      }
+
+      // Blend the last kilometre of coastline toward the water base so the
+      // anti-aliased mask edge never shows a bright sand/cyan seam.
+      if (water > 0.02) {
+        const t = smoothstep(0.02, 0.98, water);
+        r = lerp(r, 9, t);
+        g = lerp(g, 21, t);
+        b = lerp(b, 34, t);
+      }
+
+      dst[idx * 4] = clamp255(r);
+      dst[idx * 4 + 1] = clamp255(g);
+      dst[idx * 4 + 2] = clamp255(b);
+      dst[idx * 4 + 3] = 255;
+    }
+  }
+
+  const encoded = jpeg.encode({ width: TARGET_W, height: TARGET_H, data: dst }, Q_ALBEDO);
+  return Buffer.from(encoded.data);
+}
+
+/**
+ * Black Marble city emission.
+ *
+ * The raw mosaic carries a broad airglow pedestal: unpopulated desert sits at
+ * luma 35 (Sahara), 23 (Australian outback) and the mosaic's 90th percentile is
+ * 49 out of 255. Without removal every continent glows a flat purple and the
+ * night side reads as a texture, not as a photograph.
+ *
+ * We estimate that pedestal with a morphological opening (min filter at 8x
+ * downsample, then a wide blur) and keep only what rises above it. That
+ * preserves villages and highway filaments while the deserts go truly black.
+ */
+async function buildNight(nightImg) {
+  const dst = Buffer.alloc(TARGET_W * TARGET_H * 4);
+  const n = TARGET_W * TARGET_H;
+  const px = [0, 0, 0];
+  const lum = new Float32Array(n);
+
+  for (let y = 0; y < TARGET_H; y += 1) {
+    const v = y / (TARGET_H - 1);
+    for (let x = 0; x < TARGET_W; x += 1) {
+      const u = x / (TARGET_W - 1);
+      sampleBilinear(nightImg, u, v, px);
+      lum[y * TARGET_W + x] = luma(px[0], px[1], px[2]) / 255;
+    }
+  }
+
+  // Pedestal estimate: 8x min-downsample (kills compact cities), then blur the
+  // coarse grid so the estimate becomes a smooth airglow field, then upsample.
+  const DS = 8;
+  const gw = Math.ceil(TARGET_W / DS);
+  const gh = Math.ceil(TARGET_H / DS);
+  const grid = new Float32Array(gw * gh).fill(1);
+  for (let y = 0; y < TARGET_H; y += 1) {
+    const gy = (y / DS) | 0;
+    for (let x = 0; x < TARGET_W; x += 1) {
+      const gx = (x / DS) | 0;
+      const value = lum[y * TARGET_W + x];
+      const gi = gy * gw + gx;
+      if (value < grid[gi]) grid[gi] = value;
+    }
+  }
+  const gridBlur = boxBlur(grid, gw, gh, 6, 3);
+
+  for (let y = 0; y < TARGET_H; y += 1) {
+    const gy = Math.min(gh - 1, y / DS);
+    const gy0 = Math.floor(gy);
+    const gy1 = Math.min(gh - 1, gy0 + 1);
+    const fy = gy - gy0;
+    for (let x = 0; x < TARGET_W; x += 1) {
+      const gx = Math.min(gw - 1, x / DS);
+      const gx0 = Math.floor(gx);
+      const gx1 = Math.min(gw - 1, gx0 + 1);
+      const fx = gx - gx0;
+      const bgTop = gridBlur[gy0 * gw + gx0] + (gridBlur[gy0 * gw + gx1] - gridBlur[gy0 * gw + gx0]) * fx;
+      const bgBottom = gridBlur[gy1 * gw + gx0] + (gridBlur[gy1 * gw + gx1] - gridBlur[gy1 * gw + gx0]) * fx;
+      const bg = bgTop + (bgBottom - bgTop) * fy;
+
+      const l = lum[y * TARGET_W + x];
+      // Keep 92% of the pedestal subtracted so the faintest settlements survive.
+      const emission = clamp01((l - bg * 0.92) / (1 - 0.32));
+      const shaped = emission > 0 ? Math.pow(emission, 0.86) : 0;
+      // Subtle warm bias baked in; the shader adds the per-density colour
+      // temperature ladder (sodium amber -> LED white).
+      const value = clamp255(shaped * 1.06 * 255);
+      const idx = (y * TARGET_W + x) * 4;
+      dst[idx] = value;
+      dst[idx + 1] = clamp255(value * 0.955);
+      dst[idx + 2] = clamp255(value * 0.88);
+      dst[idx + 3] = 255;
+    }
+  }
+
+  // Two gentle blur passes remove JPEG mosquito noise between individual
+  // streetlights; roads stay visible because their contrast is much higher.
+  const smooth = boxBlur(
+    Float32Array.from({ length: n }, (_, i) => dst[i * 4]),
+    TARGET_W, TARGET_H, 1, 1,
+  );
+  for (let i = 0; i < n; i += 1) {
+    const value = clamp255(Math.round(smooth[i]));
+    dst[i * 4] = value;
+    dst[i * 4 + 1] = clamp255(Math.round(value * 0.955));
+    dst[i * 4 + 2] = clamp255(Math.round(value * 0.88));
+  }
+
+  const encoded = jpeg.encode({ width: TARGET_W, height: TARGET_H, data: dst }, Q_NIGHT);
+  return Buffer.from(encoded.data);
+}
+
+/**
+ * Cloud optical density from NASA's cloud climatology mosaic.
+ *
+ * fair_clouds_4k is a multi-day composite: it stores coverage in alpha (mean
+ * 0.15, p90 0.54) and its RGB payload is essentially white, so alpha *is* the
+ * optical depth. Two of its properties need cleaning before it can drive a
+ * shader that will be inspected from 50 km:
+ *
+ *   • Salt-and-pepper alpha noise that renders as white speckle,
+ *   • thin full-width discontinuities where the source tiles were stitched,
+ *     which show up as horizontal seams circling the planet.
+ *
+ * A 3x3 median removes the speckle without eating real cirrus filaments, and a
+ * 1.5-pixel vertical blur melts the stitching lines.
+ */
+async function buildClouds(cloudImg) {
+  const n = TARGET_W * TARGET_H;
+  const raw = new Float32Array(n);
+
+  for (let y = 0; y < TARGET_H; y += 1) {
+    const sy = Math.min(cloudImg.height - 1, Math.round((y / (TARGET_H - 1)) * (cloudImg.height - 1)));
+    for (let x = 0; x < TARGET_W; x += 1) {
+      const sx = Math.min(cloudImg.width - 1, Math.round((x / (TARGET_W - 1)) * (cloudImg.width - 1)));
+      raw[y * TARGET_W + x] = cloudImg.data[(sy * cloudImg.width + sx) * 4 + 3] / 255;
+    }
+  }
+
+  // --- 5x5 median ---
+  // The mosaic is assembled from swaths, so it carries both salt-and-pepper
+  // coverage noise and 1-2 px straight seam lines. A 3x3 median removes the
+  // speckle; the 5x5 window is what actually erases the seam lines, and it
+  // still preserves 10+ px cumulus structure, which is all the deck needs at
+  // the resolutions this renderer displays.
+  const median = new Float32Array(n);
+  const win = new Float32Array(25);
+  for (let y = 0; y < TARGET_H; y += 1) {
+    for (let x = 0; x < TARGET_W; x += 1) {
+      let k = 0;
+      for (let dy = -2; dy <= 2; dy += 1) {
+        const yy = Math.min(TARGET_H - 1, Math.max(0, y + dy));
+        for (let dx = -2; dx <= 2; dx += 1) {
+          // wrap in longitude so there is no seam at the antimeridian
+          const xx = (x + dx + TARGET_W) % TARGET_W;
+          win[k++] = raw[yy * TARGET_W + xx];
+        }
+      }
+      for (let i = 1; i < 25; i += 1) {
+        const v = win[i];
+        let j = i - 1;
+        while (j >= 0 && win[j] > v) { win[j + 1] = win[j]; j -= 1; }
+        win[j + 1] = v;
+      }
+      median[y * TARGET_W + x] = win[12];
+    }
+  }
+
+  const smooth = boxBlur(median, TARGET_W, TARGET_H, 1, 1);
+
+  const dst = Buffer.alloc(n * 4);
+  const GAMMA = 0.70;
+  const GAIN = 1.05;
+  for (let i = 0; i < n; i += 1) {
+    const density = clamp01(Math.pow(clamp01(smooth[i]), GAMMA) * GAIN);
+    const value = clamp255(density * 255);
+    dst[i * 4] = value;
+    dst[i * 4 + 1] = value;
+    dst[i * 4 + 2] = value;
+    dst[i * 4 + 3] = 255;
+  }
+
+  const encoded = jpeg.encode({ width: TARGET_W, height: TARGET_H, data: dst }, Q_CLOUDS);
+  return Buffer.from(encoded.data);
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+const REQUIRED_OUTPUTS = [
+  ['earth_day.jpg', 300_000],
+  ['earth_night.jpg', 100_000],
+  ['earth_specular.jpg', 200_000],
+  ['earth_topology.jpg', 200_000],
+  ['earth_clouds.jpg', 200_000],
+];
+
+async function allOutputsValid() {
+  for (const [file, minBytes] of REQUIRED_OUTPUTS) {
+    try {
+      const p = path.join(OUT_DIR, file);
+      const stats = await stat(p);
+      if (stats.size < minBytes) return false;
+      if (!probeImage(await readFile(p))) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
 async function main() {
   await mkdir(OUT_DIR, { recursive: true });
   await mkdir(CACHE_DIR, { recursive: true });
 
-  console.log(`\n🌊  NASA Bathymetric Topography Pipeline → ${path.relative(ROOT, OUT_DIR)}${FORCE ? ' (forced)' : ''}`);
+  console.log(`\n🌍  Earth texture pipeline → ${path.relative(ROOT, OUT_DIR)}${FORCE ? ' (forced)' : ''}`);
 
-  // 1. Download Base Raw Assets
-  const [cloudsBuf, bathyBuf, nightBuf, topoBuf, truecolorBuf, waterBuf, specBuf] = await Promise.all([
+  if (!FORCE && (await allOutputsValid())) {
+    console.log('  ✔ All 5 maps present and valid — skipping download & synthesis.');
+    console.log('    Run with --force to rebuild.\n');
+    return;
+  }
+
+  await seedCacheFromOutputs();
+
+  console.log('  ⬇  Fetching source imagery…');
+  const [cloudsBuf, trueColorBuf, waterBuf, nightBuf, srtmBuf, heightFieldBuf] = await Promise.all([
     downloadCached('raw_clouds.jpg', [
-      { url: `${THREE_PLANETS}/earth_bump_roughness_clouds_4096.jpg`, note: 'three.js packed 4K (blue=clouds)' },
-      { url: `${WEBGL_EARTH}/fair_clouds_4k.png`, note: 'webgl-earth 4K fair clouds' },
-      { url: `${GLOBE_GL}/clouds/clouds.png`, note: 'globe.gl clouds' },
+      { url: `${WEBGL_EARTH}/fair_clouds_4k.png`, note: 'NASA cloud climatology 4K' },
+      { url: `${THREE_PLANETS}/earth_bump_roughness_clouds_4096.jpg`, note: 'three.js packed 4K (B = clouds)' },
     ], 200_000),
 
-    downloadCached('raw_bathy_5400.jpg', [
-      { url: NASA_BATHY_JULY_GSFC, note: 'NASA Visible Earth July 5400x2700 Topo & Bathy' },
-      { url: NASA_BATHY_JULY_ESD, note: 'NASA ESD July 5400x2700 Topo & Bathy' },
-      { url: NASA_BATHY_DEC_GSFC, note: 'NASA Visible Earth Dec 5400x2700 Topo & Bathy' },
-      { url: `${THREE_PLANETS}/earth_day_4096.jpg`, note: 'three.js 4K Blue Marble fallback' },
-    ], 300_000),
-
-    downloadCached('raw_night_4096.jpg', [
-      { url: 'https://assets.science.nasa.gov/content/dam/science/esd/eo/images/imagerecords/144000/144898/BlackMarble_2016_3km.jpg', note: 'NASA Visible Earth Black Marble 2016 3km' },
-      { url: `${THREE_PLANETS}/earth_night_4096.jpg`, note: 'three.js Black Marble 4K' },
-      { url: `${THREE_GLOBE}/earth-night.jpg`, note: 'three-globe night' },
-    ], 100_000),
-
-    downloadCached('raw_topo_4096.jpg', [
-      { url: `${WEBGL_EARTH}/elev_bump_4k.jpg`, note: 'webgl-earth SRTM elevation' },
-      { url: `${THREE_GLOBE}/earth-topology.png`, note: 'three-globe topology' },
-    ], 100_000),
-
     downloadCached('raw_truecolor_4k.jpg', [
-      { url: 'https://raw.githubusercontent.com/turban/webgl-earth/master/images/2_no_clouds_4k.jpg', note: 'NASA 4K Blue Marble NextGen truecolor' },
-      { url: `${THREE_PLANETS}/earth_atmos_2048.jpg`, note: 'three.js planetary color fallback' },
+      { url: `${WEBGL_EARTH}/2_no_clouds_4k.jpg`, note: 'Blue Marble NextGen 4K true colour' },
+      { url: `${THREE_PLANETS}/earth_atmos_2048.jpg`, note: 'three.js planetary fallback' },
     ], 300_000),
 
     downloadCached('raw_water_4k.png', [
-      { url: 'https://raw.githubusercontent.com/turban/webgl-earth/master/images/water_4k.png', note: 'webgl-earth 4K pixel-perfect water mask' },
-    ], 500_000),
+      { url: `${WEBGL_EARTH}/water_4k.png`, note: '4K ocean mask' },
+    ], 400_000),
 
-    downloadCached('raw_specular.jpg', [
-      { url: `${THREE_PLANETS}/earth_specular_2048.jpg`, note: 'three.js specular 2K' },
-      { url: `${THREE_GLOBE}/earth-water.png`, note: 'three-globe water mask' },
-    ], 50_000),
+    downloadCached('raw_night_4096.jpg', [
+      { url: `${THREE_PLANETS}/earth_night_4096.jpg`, note: 'Black Marble 4K' },
+      { url: `${THREE_GLOBE}/earth-night.jpg`, note: 'three-globe night' },
+    ], 100_000),
+
+    downloadCached('raw_srtm_4k.jpg', [
+      { url: `${WEBGL_EARTH}/elev_bump_4k.jpg`, note: 'SRTM elevation 4K' },
+      { url: `${THREE_GLOBE}/earth-topology.png`, note: 'three-globe topology' },
+    ], 100_000),
+
+    downloadCached('raw_heightfield.jpg', [
+      { url: NASA_BATHY_JULY, note: 'NASA topo + bathymetry 5400x2700' },
+      { url: NASA_BATHY_DEC, note: 'NASA topo + bathymetry (Dec) 5400x2700' },
+      { url: `${THREE_PLANETS}/earth_day_4096.jpg`, note: 'three.js Blue Marble fallback' },
+    ], 200_000),
   ]);
 
-  console.log('  ✔ Base asset downloads verified. Decoding textures...');
-  const cloudsRawImg = decodeBuffer(cloudsBuf);
-  const bathyImg = decodeBuffer(bathyBuf);
+  console.log('  ⚙  Decoding sources…');
+  const cloudsImg = decodeBuffer(cloudsBuf);
+  const trueColorImg = decodeBuffer(trueColorBuf);
+  const waterImg = decodeBuffer(waterBuf);
   const nightImg = decodeBuffer(nightBuf);
-  const topoImg = decodeBuffer(topoBuf);
-  const truecolorImg = decodeBuffer(truecolorBuf);
-  const water4kImg = decodeBuffer(waterBuf);
-  const spec2kImg = decodeBuffer(specBuf);
+  const srtmImg = decodeBuffer(srtmBuf);
+  const heightFieldImg = decodeBuffer(heightFieldBuf);
 
-  const TARGET_W = 4096;
-  const TARGET_H = 2048;
+  console.log('  ⚙  4K ocean mask…');
+  const specular = await buildSpecularMask(waterImg, null);
+  await writeFile(path.join(OUT_DIR, 'earth_specular.jpg'), specular);
+  console.log(`  ✔  earth_specular.jpg  ${mb(specular.length)}`);
 
-  // -------------------------------------------------------------------------
-  // Process 1: earth_specular.jpg (Pixel-perfect 4096x2048 unified water mask)
-  // Combines 4K water mask with 2K specular to ensure all marginal seas
-  // (Mediterranean, Red Sea, Persian Gulf, Caspian Sea, Black Sea) are captured.
-  // -------------------------------------------------------------------------
-  console.log('  ⚙ Generating pixel-perfect 4K water mask...');
-  const specDst = Buffer.alloc(TARGET_W * TARGET_H * 4);
-  for (let y = 0; y < TARGET_H; y++) {
-    const s2y = Math.floor((y / (TARGET_H - 1)) * (spec2kImg.height - 1));
-    for (let x = 0; x < TARGET_W; x++) {
-      const s2x = Math.floor((x / (TARGET_W - 1)) * (spec2kImg.width - 1));
-      const idx4k = (y * TARGET_W + x) * 4;
-      const idx2k = (s2y * spec2kImg.width + s2x) * 4;
-      const w4k = water4kImg.data[idx4k];
-      const s2k = spec2kImg.data[idx2k];
-      const combined = Math.max(w4k, s2k);
-      specDst[idx4k] = combined;
-      specDst[idx4k + 1] = combined;
-      specDst[idx4k + 2] = combined;
-      specDst[idx4k + 3] = 255;
-    }
-  }
-  const specEncoded = jpeg.encode({ width: TARGET_W, height: TARGET_H, data: specDst }, JPEG_QUALITY);
-  await writeFile(path.join(OUT_DIR, 'earth_specular.jpg'), Buffer.from(specEncoded.data));
-  console.log('  ✔ earth_specular.jpg generated (4096x2048)');
+  const waterMask = Buffer.from(decodeBuffer(specular).data);
 
-  // -------------------------------------------------------------------------
-  // Process 2: earth_clouds.jpg (4096x2048 luminance cloud cover)
-  // -------------------------------------------------------------------------
-  const cloudsOutPath = path.join(OUT_DIR, 'earth_clouds.jpg');
-  if (FORCE || !(await stat(cloudsOutPath).then(s => s.size > 200000).catch(() => false))) {
-    const cloudDst = Buffer.alloc(TARGET_W * TARGET_H * 4);
-    const isPacked = cloudsRawImg.width === 4096 && cloudsRawImg.data[0] !== cloudsRawImg.data[2]; // packed has Blue=clouds
-    for (let y = 0; y < TARGET_H; y++) {
-      const sy = Math.floor((y / (TARGET_H - 1)) * (cloudsRawImg.height - 1));
-      for (let x = 0; x < TARGET_W; x++) {
-        const sx = Math.floor((x / (TARGET_W - 1)) * (cloudsRawImg.width - 1));
-        const sIdx = (sy * cloudsRawImg.width + sx) * 4;
-        const val = isPacked ? cloudsRawImg.data[sIdx + 2] : cloudsRawImg.data[sIdx];
-        const dIdx = (y * TARGET_W + x) * 4;
-        cloudDst[dIdx] = val;
-        cloudDst[dIdx + 1] = val;
-        cloudDst[dIdx + 2] = val;
-        cloudDst[dIdx + 3] = 255;
-      }
-    }
-    const encoded = jpeg.encode({ width: TARGET_W, height: TARGET_H, data: cloudDst }, JPEG_QUALITY);
-    await writeFile(cloudsOutPath, Buffer.from(encoded.data));
-  }
-  console.log('  ✔ earth_clouds.jpg validated');
+  console.log('  ⚙  Cloud optical density…');
+  const clouds = await buildClouds(cloudsImg);
+  await writeFile(path.join(OUT_DIR, 'earth_clouds.jpg'), clouds);
+  console.log(`  ✔  earth_clouds.jpg  ${mb(clouds.length)}`);
 
-  // -------------------------------------------------------------------------
-  // Process 3 & 4: earth_day.jpg and earth_night.jpg with Bathymetry & True-Color
-  // -------------------------------------------------------------------------
-  console.log('  ⚙ Synthesizing cinema-grade Bathymetric Topographic textures (4096x2048)...');
-  const dayDst = Buffer.alloc(TARGET_W * TARGET_H * 4);
-  const nightDst = Buffer.alloc(TARGET_W * TARGET_H * 4);
-  const topoDst = Buffer.alloc(TARGET_W * TARGET_H * 4);
+  console.log('  ⚙  Land albedo + deep-water base…');
+  const albedo = await buildAlbedo(trueColorImg, waterMask);
+  await writeFile(path.join(OUT_DIR, 'earth_day.jpg'), albedo);
+  console.log(`  ✔  earth_day.jpg  ${mb(albedo.length)}`);
 
-  for (let y = 0; y < TARGET_H; y++) {
-    const by = Math.floor((y / (TARGET_H - 1)) * (bathyImg.height - 1));
-    const ny = Math.floor((y / (TARGET_H - 1)) * (nightImg.height - 1));
-    const ty = Math.floor((y / (TARGET_H - 1)) * (topoImg.height - 1));
-    const tcy = Math.floor((y / (TARGET_H - 1)) * (truecolorImg.height - 1));
+  console.log('  ⚙  Height field (bathymetry + SRTM)…');
+  const heightField = await buildHeightField(heightFieldImg, srtmImg, waterMask);
+  await writeFile(path.join(OUT_DIR, 'earth_topology.jpg'), heightField);
+  console.log(`  ✔  earth_topology.jpg  ${mb(heightField.length)}`);
 
-    // Latitude in degrees: +90° (North Pole) to -90° (South Pole)
-    const latDeg = (1.0 - (y / (TARGET_H - 1)) * 2.0) * 90.0;
+  console.log('  ⚙  City emission (airglow removed)…');
+  const night = await buildNight(nightImg);
+  await writeFile(path.join(OUT_DIR, 'earth_night.jpg'), night);
+  console.log(`  ✔  earth_night.jpg  ${mb(night.length)}`);
 
-    for (let x = 0; x < TARGET_W; x++) {
-      const bx = Math.floor((x / (TARGET_W - 1)) * (bathyImg.width - 1));
-      const nx = Math.floor((x / (TARGET_W - 1)) * (nightImg.width - 1));
-      const tx = Math.floor((x / (TARGET_W - 1)) * (topoImg.width - 1));
-      const tcx = Math.floor((x / (TARGET_W - 1)) * (truecolorImg.width - 1));
-
-      // Longitude in degrees: -180° to +180°
-      const lonDeg = ((x / (TARGET_W - 1)) * 2.0 - 1.0) * 180.0;
-
-      const outIdx = (y * TARGET_W + x) * 4;
-      const bIdx = (by * bathyImg.width + bx) * 4;
-      const nIdx = (ny * nightImg.width + nx) * 4;
-      const tIdx = (ty * topoImg.width + tx) * 4;
-      const tcIdx = (tcy * truecolorImg.width + tcx) * 4;
-
-      const waterVal = specDst[outIdx] / 255; // Exact 4K water mask (1 = water, 0 = land)
-      const bg = bathyImg.data[bIdx + 1];
-      const bb = bathyImg.data[bIdx + 2];
-
-      const nr = nightImg.data[nIdx];
-      const ng = nightImg.data[nIdx + 1];
-      const nb = nightImg.data[nIdx + 2];
-
-      const landElevation = topoImg.data[tIdx];
-
-      // --- LAND SURFACE: True-color satellite albedo + natural vibrance ---
-      const tcr = truecolorImg.data[tcIdx];
-      const tcg = truecolorImg.data[tcIdx + 1];
-      const tcb = truecolorImg.data[tcIdx + 2];
-
-      let lr = tcr;
-      let lg = tcg;
-      let lb = tcb;
-
-      const isVegetation = lg > lr && lg > lb;
-      const isDesert = lr > lg && lr > 115;
-      const isGlacier = lr > 185 && lg > 185 && lb > 185;
-
-      if (isVegetation) {
-        // Deep, rich tropical and temperate foliage
-        lr = Math.round(lr * 0.90);
-        lg = Math.min(255, Math.round(lg * 1.14));
-        lb = Math.round(lb * 0.86);
-      } else if (isDesert) {
-        // Warm golden-sand and terracotta desert tones matching reference
-        lr = Math.min(255, Math.round(lr * 1.08));
-        lg = Math.round(lg * 1.01);
-        lb = Math.round(lb * 0.90);
-      } else if (isGlacier) {
-        // Pure crystalline ice with subtle polar cyan edge
-        lr = Math.min(255, Math.round(lr * 1.03));
-        lg = Math.min(255, Math.round(lg * 1.04));
-        lb = Math.min(255, Math.round(lb * 1.08));
-      }
-
-      // Micro-relief shading on land based on elevation
-      const reliefShade = 0.88 + (landElevation / 255) * 0.24;
-      lr = Math.min(255, Math.round(lr * reliefShade));
-      lg = Math.min(255, Math.round(lg * reliefShade));
-      lb = Math.min(255, Math.round(lb * reliefShade));
-
-      // --- OCEAN SURFACE: Calibrated GEBCO/NASA bathymetric depth mapping (Daylight only) ---
-      // Extracts seafloor depth from NASA's blue & green gradient (12 abyss to 108 coast)
-      const rawBathy = 0.35 * bg + 0.65 * bb;
-      const normBathy = Math.max(0, Math.min(1, (rawBathy - 11) / 95));
-      const [oceanR, oceanG, oceanB] = evaluateBathyColor(normBathy);
-
-      // --- UNIFIED CONTINUOUS TOPOLOGY (Smooth coastlines, zero ledges) ---
-      const oceanElevation = Math.round(15 + normBathy * 70); // 15 (abyss) to 85 (coast)
-      const landElevationNorm = Math.round(85 + Math.max(0, landElevation - 23) * (170 / 232)); // 85 to 255
-      const topoVal = waterVal >= 0.5 ? oceanElevation : landElevationNorm;
-
-      // --- DAY MAP: Sharp, clean coastlines without dirty bleeding ---
-      let finalDayR, finalDayG, finalDayB;
-      if (waterVal >= 0.5) {
-        finalDayR = oceanR;
-        finalDayG = oceanG;
-        finalDayB = oceanB;
-      } else if (waterVal <= 0.05) {
-        finalDayR = lr;
-        finalDayG = lg;
-        finalDayB = lb;
-      } else {
-        const t = (waterVal - 0.05) / 0.45;
-        finalDayR = lerp(lr, oceanR, t);
-        finalDayG = lerp(lg, oceanG, t);
-        finalDayB = lerp(lb, oceanB, t);
-      }
-
-      dayDst[outIdx]     = Math.min(255, Math.round(finalDayR));
-      dayDst[outIdx + 1] = Math.min(255, Math.round(finalDayG));
-      dayDst[outIdx + 2] = Math.min(255, Math.round(finalDayB));
-      dayDst[outIdx + 3] = 255;
-
-      // --- NIGHT MAP: PURE BLACK OCEAN + CRISP NASA BLACK MARBLE CITY LIGHTS ---
-      // Real-world physics: Water does NOT emit light. The ocean at night is 100% PITCH BLACK (#000000).
-      // Only human settlements and cities on land emit light.
-      let finalNightR, finalNightG, finalNightB;
-      if (waterVal >= 0.5) {
-        // Pure pitch-black night ocean
-        finalNightR = 0;
-        finalNightG = 0;
-        finalNightB = 0;
-      } else if (waterVal <= 0.05) {
-        // Pure land city lights
-        finalNightR = nr;
-        finalNightG = ng;
-        finalNightB = nb;
-      } else {
-        // Clean anti-aliased coastlines fading to black
-        const t = (waterVal - 0.05) / 0.45;
-        finalNightR = lerp(nr, 0, t);
-        finalNightG = lerp(ng, 0, t);
-        finalNightB = lerp(nb, 0, t);
-      }
-
-      nightDst[outIdx]     = Math.min(255, Math.round(finalNightR));
-      nightDst[outIdx + 1] = Math.min(255, Math.round(finalNightG));
-      nightDst[outIdx + 2] = Math.min(255, Math.round(finalNightB));
-      nightDst[outIdx + 3] = 255;
-
-      // TOPOLOGY MAP
-      topoDst[outIdx]     = topoVal;
-      topoDst[outIdx + 1] = topoVal;
-      topoDst[outIdx + 2] = topoVal;
-      topoDst[outIdx + 3] = 255;
-    }
-  }
-
-  const dayEncoded = jpeg.encode({ width: TARGET_W, height: TARGET_H, data: dayDst }, JPEG_QUALITY);
-  await writeFile(path.join(OUT_DIR, 'earth_day.jpg'), Buffer.from(dayEncoded.data));
-  console.log(`  ✔ earth_day.jpg generated (${kb(dayEncoded.data.length)})`);
-
-  const nightEncoded = jpeg.encode({ width: TARGET_W, height: TARGET_H, data: nightDst }, JPEG_QUALITY);
-  await writeFile(path.join(OUT_DIR, 'earth_night.jpg'), Buffer.from(nightEncoded.data));
-  console.log(`  ✔ earth_night.jpg generated (${kb(nightEncoded.data.length)})`);
-
-  const topoEncoded = jpeg.encode({ width: TARGET_W, height: TARGET_H, data: topoDst }, JPEG_QUALITY);
-  await writeFile(path.join(OUT_DIR, 'earth_topology.jpg'), Buffer.from(topoEncoded.data));
-  console.log(`  ✔ earth_topology.jpg generated (${kb(topoEncoded.data.length)})`);
-
-  // Manifest generation
   const manifest = [];
-  for (const f of ['earth_day.jpg', 'earth_night.jpg', 'earth_specular.jpg', 'earth_topology.jpg', 'earth_clouds.jpg']) {
-    const p = path.join(OUT_DIR, f);
-    const s = await stat(p);
-    const info = probeImage(await readFile(p));
-    manifest.push({ file: f, width: info.width, height: info.height, bytes: s.size, sha256: sha(await readFile(p)) });
-    console.log(`  ★ ${f.padEnd(20)} ${`${info.width}x${info.height}`.padEnd(10)} ${kb(s.size).padStart(9)}  [BATHYMETRIC READY]`);
+  for (const [file] of REQUIRED_OUTPUTS) {
+    const p = path.join(OUT_DIR, file);
+    const buf = await readFile(p);
+    const info = probeImage(buf);
+    const size = await stat(p);
+    manifest.push({
+      file,
+      width: info.width,
+      height: info.height,
+      bytes: size.size,
+      sha256: createHash('sha256').update(buf).digest('hex'),
+    });
+    console.log(`  ★  ${file.padEnd(20)} ${`${info.width}x${info.height}`.padEnd(10)} ${mb(size.size).padStart(9)}`);
   }
   await writeFile(path.join(OUT_DIR, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 
-  console.log(`\n✨ All 5 Bathymetric Topographic textures verified successfully!\n`);
+  console.log('\n✨  Textures rebuilt.\n');
 }
 
 main().catch((err) => {

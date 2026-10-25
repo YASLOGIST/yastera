@@ -1,101 +1,181 @@
-// Cloud shell — fragment stage (radius 1.0022: ~14 km troposphere).
+#include <common>
+#include <logdepthbuf_pars_fragment>
+// ---------------------------------------------------------------------------
+// Cloud deck — fragment stage.
 //
-// Multi-scattering optical model: high single-scattering albedo for pure water
-// droplets, forward-peaked Mie scattering (silver lining corona), micro-relief
-// self-shadowing, and high-altitude twilight illumination along the terminator.
+// A single shell lit like a participating medium rather than a white sprite:
+//
+//  • Normal from the density gradient (analytic tangent frame), so cumulus
+//    tops catch the sun and the bases fall into shadow.
+//  • Sun-direction tap marching = self-shadowing; thick cores go grey-blue,
+//    thin edges glow (powder / silver lining).
+//  • Forward Mie phase: clouds backlit by the sun flare along their rims.
+//  • Sunlight is transmitted through the atmosphere, so the deck reddens
+//    correctly along the terminator and stays dark on the night side.
+// ---------------------------------------------------------------------------
 
 uniform sampler2D uCloudsTexture;
 uniform vec3  uSunDirection;
-uniform float uCloudOpacity;
 uniform float uSunIntensity;
-uniform float uAtmosphereIntensity;
+uniform float uCloudOpacity;
 uniform float uCloudRelief;
+uniform float uAtmosphereIntensity;
 uniform float uCameraDistance;
+uniform float uCloudTime;
+uniform float uCloudDrift;
+uniform float uDriftScale;
+uniform float uTime;
+uniform vec2  uCloudScale;
+uniform vec2  uCloudOffset;
+uniform float uLayerAlpha;
+uniform float uLayerMode;   // 0 = low/mid deck from texture, 1 = high cirrus (procedural)
 
 in vec2 vUv;
 in vec3 vPosW;
 in vec3 vNormalW;
 in vec3 vCenterW;
+in vec3 vEastW;
+in vec3 vNorthW;
+in vec3 vLocalPos;
 
 out vec4 fragColor;
 
-const float PI = 3.141592653589793;
-
-const vec3 CLOUD_ALBEDO   = vec3(0.98, 0.99, 1.00);
-const vec3 SUNSET_GOLD    = vec3(1.00, 0.62, 0.22);
-const vec3 SUNSET_CRIMSON = vec3(0.96, 0.35, 0.10);
-const vec3 ORBITAL_CYAN   = vec3(0.18, 0.54, 1.00);
-
-float sat(float x) { return clamp(x, 0.0, 1.0); }
-
-// Henyey-Greenstein phase function for forward cloud droplet scattering
-float phaseHG(float cosAngle, float g) {
-  float g2 = g * g;
-  return (1.0 - g2) / (4.0 * PI * pow(1.0 + g2 - 2.0 * g * cosAngle, 1.5));
-}
-
-// Screen-space normal perturbation for cumulus cloud relief
-vec3 perturbNormal(vec3 pos, vec3 N, float height) {
-  vec3 dpdx = dFdx(pos);
-  vec3 dpdy = dFdy(pos);
-  float dhdx = dFdx(height);
-  float dhdy = dFdy(height);
-  vec3 r1 = cross(dpdy, N);
-  vec3 r2 = cross(N, dpdx);
-  float det = dot(dpdx, r1);
-  vec3 grad = sign(det) * (dhdx * r1 + dhdy * r2);
-  return normalize(abs(det) * N - grad);
-}
+const vec3 CLOUD_ALBEDO = vec3(0.96, 0.975, 1.0);
+const vec3 AMBIENT_SKY  = vec3(0.12, 0.21, 0.40);
 
 void main() {
-  float raw = texture(uCloudsTexture, vUv).r;
-  // Natural non-linear cloud optical depth curve
-  float density = smoothstep(0.05, 0.76, raw);
+  #include <logdepthbuf_fragment>
+  vec3 N = normalize(vNormalW);
+  vec3 V = normalize(cameraPosition - vPosW);
+  vec3 L = normalize(uSunDirection);
 
-  if (density * uCloudOpacity < 0.002) discard;
+  float cosLat = max(cos((vUv.y - 0.5) * 3.14159265), 0.08);
+  float zoom = 1.0 - smoothstep(1.010, 1.50, uCameraDistance);
 
-  vec3 sphereNormal = normalize(vNormalW);
-  vec3 viewDir = normalize(cameraPosition - vPosW);
-  vec3 sunDir = normalize(uSunDirection);
+  vec2 baseUv = vUv * uCloudScale + uCloudOffset;
+  vec2 cuv = cloudAdvect(baseUv, uCloudTime, uCloudDrift * uDriftScale);
 
-  // Micro-relief: cumulus clouds catch sunlight on sunward tops
-  vec3 N = perturbNormal(vPosW, sphereNormal, density * uCloudRelief);
+  float density = cloudDensity(uCloudsTexture, cuv);
 
-  float sunOrientation = dot(sphereNormal, sunDir);
-  float dayMix = smoothstep(-0.20, 0.32, sunOrientation);
-  float twilight = smoothstep(-0.28, 0.04, sunOrientation) * smoothstep(0.28, -0.02, sunOrientation);
+  if (uLayerMode > 0.5) {
+    // --- High cirrus deck -------------------------------------------------
+    // Cirrus is not a scaled copy of the tropospheric deck: it is fibrous ice
+    // crystal stretched by the jet stream. Generating it on the sphere keeps it
+    // seamless and free of the equirectangular stretch a second texture tap
+    // would inherit, and it layers visibly on top of the cumulus deck below.
+    vec3 p = normalize(vLocalPos);
+    vec3 streakDir = normalize(vec3(p.x, p.y * 4.2, p.z));
+    float drift = uTime * 0.0011;
+    float fibre = fbmSphere(streakDir + vec3(drift, 0.0, drift * 0.6), 11.0, 4.0);
+    float fibre2 = fbmSphere(streakDir * 2.1 - vec3(drift * 0.7, 0.0, 0.0), 26.0, 3.0);
+    float coverage = fbmSphere(p, 2.4, 2.0);
+    float mask = smoothstep(0.40, 0.74, coverage);
+    float shapes = smoothstep(0.46, 0.80, fibre * 0.72 + fibre2 * 0.28);
+    density = clamp(shapes * mask * 1.35, 0.0, 1.0);
+  }
 
-  // Normal dot sun for relief lighting and self-shadowing
-  float NdotL = dot(N, sunDir);
-  float grazing = mix(3.5, 1.0, smoothstep(0.0, 0.5, sunOrientation));
-  float relief = clamp(1.0 + (NdotL - sunOrientation) * grazing, 0.60, 1.35);
+  // --- Sub-texel filament detail -----------------------------------------
+  // Evaluated on the sphere direction, so the detail is seamless in longitude,
+  // free of polar pinching, and keeps adding structure all the way down to the
+  // 50 km inspection altitude.
+  // Detail must fade with the *screen* footprint of one texel. In an
+  // equirectangular map a texel spans 1/4096 of a revolution, i.e.
+  // fwidth(vUv.x) * cosLat in surface terms — dividing by cosLat would let the
+  // noise alias into streaks near the poles.
+  float detailFade = 1.0 - smoothstep(0.0004, 0.0045, fwidth(vUv.x) * cosLat);
+  if (detailFade > 0.01) {
+    vec3 p = normalize(vLocalPos);
+    vec3 w = vEastW * (uTime * 0.0016) + vNorthW * (uTime * 0.0009);
+    // Two scales: broad billows plus fine fibre. Both live on the sphere, so
+    // the deck gains believable structure without inheriting the texture's
+    // latitude stretch.
+    float macro = fbmSphere(normalize(p + w * 0.03), 34.0, 4.0) * 0.55
+                + fbmSphere(normalize(p + w * 0.02), 120.0, 2.0) * 0.45;
+    float micro = fbmSphere(normalize(p - w * 0.05), 260.0, 2.0);
+    float erosion = (macro - 0.5) * 0.44 + (micro - 0.5) * 0.18;
+    density = clamp(density + erosion * detailFade * (0.25 + 0.75 * (1.0 - density)), 0.0, 1.0);
+  }
 
-  // Direct sun irradiance
-  float sunIllum = dayMix * (0.60 + 0.40 * sat(sunOrientation)) * relief;
+  float alpha = density * uCloudOpacity * uLayerAlpha;
+  if (alpha < 0.004) discard;
 
-  // Forward Mie scattering (silver lining effect when viewing backlit clouds)
-  float cosTheta = dot(viewDir, sunDir);
-  float mieForward = phaseHG(cosTheta, 0.70) * smoothstep(-0.15, 0.35, sunOrientation) * 0.42;
+  // --- Density gradient -> shading normal ---------------------------------
+  float tx = 1.5 / 4096.0;
+  float ty = 1.5 / 2048.0;
+  float dE = cloudDensity(uCloudsTexture, cuv + vec2(tx, 0.0));
+  float dW = cloudDensity(uCloudsTexture, cuv - vec2(tx, 0.0));
+  float dN = cloudDensity(uCloudsTexture, cuv + vec2(0.0, ty));
+  float dS = cloudDensity(uCloudsTexture, cuv - vec2(0.0, ty));
+  vec2 grad = vec2(dE - dW, dN - dS);
 
-  // Day illumination with high albedo
-  vec3 dayColor = CLOUD_ALBEDO * (sunIllum + mieForward) * uSunIntensity;
+  vec2 slope = grad * (0.55 + 0.45 * zoom) * uCloudRelief;
+  vec3 Np = normalize(N - (slope.x * vEastW + slope.y * vNorthW));
 
-  // High-altitude sunset illumination along the terminator (clouds catch setting sun longer than ground)
-  vec3 sunsetColor = mix(SUNSET_CRIMSON, SUNSET_GOLD, smoothstep(-0.10, 0.15, sunOrientation));
-  vec3 litClouds = mix(dayColor, sunsetColor * 1.25, twilight * 0.70);
+  vec3 T = normalize(vEastW);
+  vec3 Bn = normalize(vNorthW);
 
-  // Atmospheric limb aerial perspective: clouds near the limb pass through air column
-  float cosV = max(dot(viewDir, sphereNormal), 0.0);
-  float limbAirmass = 1.0 - pow(cosV, 2.5);
-  vec3 finalColor = mix(litClouds, ORBITAL_CYAN * 0.45 * dayMix, limbAirmass * 0.35 * uAtmosphereIntensity);
+  // --- Self-shadowing: march a few texels toward the sun -------------------
+  vec2 sunUv = vec2(dot(L, T), dot(L, Bn));
+  float sunUvLen = length(sunUv);
+  sunUv = sunUvLen > 1e-4 ? sunUv / sunUvLen : vec2(1.0, 0.0);
+  float tau = 0.0;
+  float stepLen = 0.0018 + 0.0016 * zoom;
+  for (int i = 1; i <= 3; i += 1) {
+    tau += cloudDensity(uCloudsTexture, cuv + sunUv * (stepLen * float(i)));
+  }
+  float sunVisibility = 0.45 + 0.55 * exp(-tau * 1.15);
 
-  // Night side: dark silhouettes over cities and oceans, zero ambient glow in deep space
-  finalColor = mix(vec3(0.0), finalColor, smoothstep(-0.22, 0.08, sunOrientation));
+  // --- Lighting ------------------------------------------------------------
+  float sunUp = dot(N, L);
+  float day = smoothstep(-0.055, 0.10, sunUp);
+  float nightMask = 1.0 - smoothstep(-0.13, 0.015, sunUp);
 
-  // Physical optical opacity: thick storm centers are opaque; thin cirrus edges are translucent
-  // When descending to inspect a city (low altitude), clouds gently thin to allow clear inspection
-  float zoomCloudFade = mix(0.40, 1.0, smoothstep(1.015, 1.18, uCameraDistance));
-  float alpha = density * uCloudOpacity * mix(0.30, 1.0, dayMix) * zoomCloudFade;
+  vec3 sunTint = atmosphereTransmittanceFrom(0.0022, sunUp);
+  vec3 light = vec3(1.0, 0.978, 0.952) * uSunIntensity * sunTint;
+
+  float NdotL = dot(Np, L);
+  float wrapped = clamp((NdotL + 0.32) / 1.32, 0.0, 1.0);
+
+  // Multiple-scattering approximation: interiors stay grey-blue instead of
+  // collapsing to black, edges stay bright and translucent.
+  float opticalThickness = density * 2.6;
+  float interior = exp(-opticalThickness);
+  // Ambient occlusion between cloud masses stays shallow: real cumulus are
+  // almost as bright in shadow as in sun, they just lose specular punch.
+  float occlusion = 0.84 + 0.16 * interior;
+
+  // Forward Mie scattering (silver lining when the sun is behind the deck).
+  float mu = dot(V, L);
+  float phase = hgPhase(mu, 0.62);
+  float rim = pow(1.0 - clamp(density, 0.0, 1.0), 2.0);
+
+  vec3 scattered = CLOUD_ALBEDO * light * (
+      wrapped * sunVisibility * occlusion * 1.08
+    + AMBIENT_SKY * 0.20 * (1.0 - 0.5 * density)
+    + phase * 0.55 * rim
+  );
+
+  // Warm bounce from the sunlit atmosphere below the deck.
+  scattered += CLOUD_ALBEDO * light * vec3(1.0, 0.72, 0.52) * 0.05 * (1.0 - interior);
+
+  // --- Night side: city underglow, otherwise dark -------------------------
+  vec3 nightGlow = vec3(1.0, 0.52, 0.20) * 0.020 * (1.0 - density * 0.6);
+  scattered = mix(nightGlow, scattered, day);
+  scattered *= mix(1.0, 0.72, nightMask);
+
+  // --- Aerial perspective between the camera and the deck ----------------
+  float cosV = clamp(dot(N, V), 1e-4, 1.0);
+  vec3 viewT = atmosphereTransmittanceFrom(0.0022, cosV);
+  float airMass = relativeAirMass(cosV);
+  vec3 hazeColor = vec3(0.30, 0.52, 0.92) * uSunIntensity * 0.30 * uAtmosphereIntensity;
+  vec3 finalColor = scattered * viewT + hazeColor * (vec3(1.0) - viewT) * smoothstep(-0.06, 0.2, sunUp);
+
+  // --- Opacity ------------------------------------------------------------
+  // Thin cirrus stays translucent; dense cumulus goes opaque. At night the deck
+  // still occludes city light, so the alpha floor is higher than by day.
+  float nightAlpha = mix(0.72, 1.0, day);
+  float zoomThin = mix(0.55, 1.0, smoothstep(1.015, 1.16, uCameraDistance));
+  alpha = clamp(pow(alpha, 0.82) * 1.02, 0.0, 1.0) * nightAlpha * zoomThin;
 
   fragColor = vec4(finalColor, alpha);
 }

@@ -1,3 +1,5 @@
+#include <common>
+#include <logdepthbuf_pars_fragment>
 // HDR orbital beacons — fragment stage. Additive; colour exceeds 1.0 so the
 // cores cross the bloom threshold while the soft skirt stays sub-threshold.
 
@@ -11,6 +13,7 @@ in float vDayNight;
 out vec4 fragColor;
 
 void main() {
+  #include <logdepthbuf_fragment>
   vec2 p = gl_PointCoord * 2.0 - 1.0;
   float r2 = dot(p, p);
   if (r2 > 1.0) discard;
