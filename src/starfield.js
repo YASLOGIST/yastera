@@ -1,6 +1,12 @@
 import * as THREE from 'three';
 
 import { SHADERS } from './shaderSources.js';
+import {
+  GALACTIC_DENSITY_MAX,
+  GALACTIC_NORTH,
+  galacticCrowding,
+  galacticDensity,
+} from './galacticField.js';
 
 // NOTE: the Milky Way fragment needs the procedural noise prelude from
 // lib/noise.glsl (fbm4 / valueNoise). Composition lives in shaderManifest.js so
@@ -51,7 +57,7 @@ function pickColor(rand) {
  * @param {{ count?: number, radius?: number }} [options]
  */
 export function createStarfield(pixelRatio, options = {}) {
-  const count = options.count ?? 9000;
+  const count = options.count ?? 16000;
   const radius = options.radius ?? 420;
   const rand = mulberry32(0x9e3779b9);
 
@@ -60,38 +66,42 @@ export function createStarfield(pixelRatio, options = {}) {
   const sizes = new Float32Array(count);
   const magnitudes = new Float32Array(count);
 
-  // Galactic north pole matches the Milky Way shader.
-  const galacticNorth = new THREE.Vector3(0.36, 0.84, -0.41).normalize();
-
   const dir = new THREE.Vector3();
-  const tmp = new THREE.Vector3();
   for (let i = 0; i < count; i += 1) {
-    // Uniform sphere, then rejection-sample toward the galactic plane so the
-    // star density follows the real Milky Way.
-    let accepted = false;
-    for (let attempt = 0; attempt < 8 && !accepted; attempt += 1) {
+    // Draw a direction, then accept it with probability proportional to the
+    // galactic density field. Rejection sampling is the right tool here: it
+    // reproduces the density exactly instead of approximating it with a
+    // gaussian, and the cost is trivial at load time.
+    //
+    // The attempt cap matters. Without one, a star that lands in a very empty
+    // patch of sky would loop forever. With one, that star is simply placed at
+    // the last direction drawn, which biases a negligible number of stars
+    // toward the background — the correct trade. 32 attempts puts the binding
+    // probability at well under 1% for the contrast this field uses.
+    let sinLat = 0;
+    let density = 0;
+    for (let attempt = 0; attempt < 32; attempt += 1) {
       const z = rand() * 2 - 1;
       const a = rand() * Math.PI * 2;
       const r = Math.sqrt(Math.max(0, 1 - z * z));
       dir.set(r * Math.cos(a), z, r * Math.sin(a));
-      const sinLat = dir.dot(galacticNorth);
-      const weight = 0.35 + 0.65 * Math.exp(-Math.pow(sinLat / 0.30, 2));
-      accepted = rand() < weight;
-      if (!accepted) continue;
+      sinLat = dir.dot(GALACTIC_NORTH);
+      density = galacticDensity(dir, sinLat);
+      // Normalised by the field's maximum: the density itself is >= 1, so an
+      // un-normalised comparison would accept every draw and the clustering
+      // would not happen at all.
+      if (rand() * GALACTIC_DENSITY_MAX < density) break;
+    }
 
-      positions[i * 3] = dir.x * radius;
-      positions[i * 3 + 1] = dir.y * radius;
-      positions[i * 3 + 2] = dir.z * radius;
-    }
-    if (!accepted) {
-      tmp.copy(dir);
-      positions[i * 3] = tmp.x * radius;
-      positions[i * 3 + 1] = tmp.y * radius;
-      positions[i * 3 + 2] = tmp.z * radius;
-    }
+    positions[i * 3] = dir.x * radius;
+    positions[i * 3 + 1] = dir.y * radius;
+    positions[i * 3 + 2] = dir.z * radius;
 
     // Magnitude: most stars are faint. pow() pushes the distribution hard.
-    const m = Math.pow(rand(), 3.6);
+    // Stars inside the star clouds are drawn slightly dimmer, because
+    // crowding is what makes the band look like unresolved light rather than
+    // a scatter of individual points.
+    const m = Math.pow(rand(), 3.6) * (1 - 0.25 * galacticCrowding(density));
     magnitudes[i] = m;
     sizes[i] = 1.15 + m * 2.6;
     const color = pickColor(rand);
@@ -143,7 +153,11 @@ export function createStarfield(pixelRatio, options = {}) {
     depthTest: true,
   });
 
-  const milkyWay = new THREE.Mesh(new THREE.SphereGeometry(radius * 0.85, 48, 32), milkyWayMaterial);
+  // 96x64 rather than 48x32: vDir is interpolated per-vertex, so each quad of a
+  // 48-segment sphere spans 7.5 degrees and puts a C0 kink in the galactic noise
+  // coordinates at every triangle edge. 96x64 is 12k triangles of a background
+  // mesh that is drawn once, which costs nothing measurable.
+  const milkyWay = new THREE.Mesh(new THREE.SphereGeometry(radius * 0.85, 96, 64), milkyWayMaterial);
   milkyWay.name = 'milkyWay';
   milkyWay.renderOrder = -2;
   milkyWay.frustumCulled = false;

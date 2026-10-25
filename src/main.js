@@ -345,7 +345,7 @@ async function init() {
   const beacons = createBeacons(pixelRatio, earth.uniforms.shared.uSunDirection);
   earth.spin.add(beacons);
 
-  const starfield = createStarfield(pixelRatio, { count: 9000 });
+  const starfield = createStarfield(pixelRatio, { count: 16000 });
   scene.add(starfield.group);
 
   onPixelRatioChanged = () => {
