@@ -18,17 +18,66 @@ import { CITIES, getCityLocalTime } from './cities.js';
 // ---------------------------------------------------------------------------
 // Fatal error overlay & diagnostics
 // ---------------------------------------------------------------------------
+const loaderEl = document.getElementById('loader');
+const loaderBar = document.getElementById('loader-bar');
 const fatalEl = document.getElementById('fatal');
-function reportFatal(msg) {
-  if (fatalEl) {
-    fatalEl.removeAttribute('hidden');
-    fatalEl.textContent = `[Orbital Engine Error]\n${msg}`;
+const fatalTitleEl = document.getElementById('fatal-title');
+const fatalMsgEl = document.getElementById('fatal-msg');
+const fatalReloadEl = document.getElementById('fatal-reload');
+const fatalDismissEl = document.getElementById('fatal-dismiss');
+
+/**
+ * Errors that carry no information and no action.
+ *
+ * `Script error.` is what the browser reports for an exception from another
+ * origin — there is no message, no file and no stack, so showing it tells a
+ * visitor nothing except that something, somewhere, went wrong.
+ * ResizeObserver's loop warning is emitted by the browser itself when a resize
+ * handler changes layout, and is not an exception.
+ */
+const UNACTIONABLE = ['Script error.', 'ResizeObserver loop'];
+
+// A throwing frame is not a dead app: the animation loop schedules the next
+// frame before it does any work, so one bad frame is followed by a good one.
+// The panel therefore has to distinguish the two cases, and it must not be
+// permanent: an error surface that blacks out a running scene turns a transient
+// glitch into a total outage.
+let fatalIsBlocking = false;
+let lastFatalMessage = '';
+
+function reportFatal(msg, { blocking = false } = {}) {
+  const text = String(msg ?? 'Unknown error');
+  if (UNACTIONABLE.some((frag) => text.includes(frag))) return;
+  console.error(text);
+
+  if (blocking) fatalIsBlocking = true;
+  // A blocking failure is never downgraded by a later soft one, and the same
+  // string repeated every frame must not rebuild the panel each time.
+  if (text === lastFatalMessage && !blocking) return;
+  lastFatalMessage = text;
+
+  if (!fatalEl) return;
+  if (fatalTitleEl) {
+    fatalTitleEl.textContent = fatalIsBlocking ? 'Orbital Engine Error' : 'Runtime warning';
   }
-  console.error(msg);
+  if (fatalMsgEl) fatalMsgEl.textContent = text;
+  // The loader would otherwise sit on top of the panel forever when init dies
+  // before it finished.
+  if (fatalIsBlocking) loaderEl?.classList.add('done');
+  fatalEl.classList.toggle('blocking', fatalIsBlocking);
+  if (fatalDismissEl) fatalDismissEl.hidden = fatalIsBlocking;
+  fatalEl.removeAttribute('hidden');
 }
 
+fatalReloadEl?.addEventListener('click', () => window.location.reload());
+fatalDismissEl?.addEventListener('click', () => {
+  if (fatalIsBlocking) return;
+  fatalEl?.setAttribute('hidden', '');
+  lastFatalMessage = '';
+});
+
 window.addEventListener('error', (e) => {
-  reportFatal(e.message || String(e));
+  reportFatal(e.message || String(e.error ?? e));
 });
 window.addEventListener('unhandledrejection', (e) => {
   reportFatal(e.reason?.message || String(e.reason));
@@ -104,7 +153,7 @@ renderer.debug.onShaderError = (gl, program, glVertexShader, glFragmentShader) =
   const sections = ['Shader compile failed'];
   if (vLog) sections.push(`vertex — ${programNameOf(gl, glVertexShader)}\n${vLog}`);
   if (fLog) sections.push(`fragment — ${programNameOf(gl, glFragmentShader)}\n${fLog}`);
-  reportFatal(sections.join('\n\n'));
+  reportFatal(sections.join('\n\n'), { blocking: true });
 };
 
 const scene = new THREE.Scene();
@@ -170,8 +219,6 @@ if (!canFloatMSAA) {
 // ---------------------------------------------------------------------------
 // Asset Loading
 // ---------------------------------------------------------------------------
-const loaderEl = document.getElementById('loader');
-const loaderBar = document.getElementById('loader-bar');
 const loadingManager = new THREE.LoadingManager();
 
 loadingManager.onProgress = (_url, loaded, total) => {
@@ -183,7 +230,7 @@ loadingManager.onLoad = () => {
 };
 
 loadingManager.onError = (url) => {
-  reportFatal(`Failed to load asset: ${url}\nPlease run "npm run fetch-assets".`);
+  reportFatal(`Failed to load asset: ${url}\nPlease run "npm run fetch-assets".`, { blocking: true });
 };
 
 const textureLoader = new THREE.TextureLoader(loadingManager);
@@ -623,6 +670,7 @@ async function init() {
   const flyQuatEnd = new THREE.Quaternion();
   const flyQuatCur = new THREE.Quaternion();
 
+  let contextLost = false;
   let cloudTime = 0;
   let elapsedTime = 0;
   let frameCount = 0;
@@ -662,6 +710,30 @@ async function init() {
     lastFpsUpdate = performance.now();
     lastAdapt = performance.now();
     timer.update();
+  });
+
+  // --- Graphics context loss -----------------------------------------------
+  // A driver reset, a GPU hang or a backgrounded mobile tab can take the WebGL
+  // context away at any moment. Nothing listens for that by default: the canvas
+  // freezes on its last frame and every later draw call fails, which looks like
+  // the app simply died. `preventDefault` is what tells the browser the app
+  // intends to carry on, and is required before `webglcontextrestored` fires.
+  canvas.addEventListener('webglcontextlost', (event) => {
+    event.preventDefault();
+    contextLost = true;
+    reportFatal('Graphics context lost. Waiting for the driver to restore it.');
+  });
+
+  canvas.addEventListener('webglcontextrestored', () => {
+    contextLost = false;
+    fatalEl?.setAttribute('hidden', '');
+    lastFatalMessage = '';
+    // three re-uploads textures and programs lazily on the next render, but the
+    // clock kept running while the context was gone. Without this the first
+    // frame after restoration sees a multi-second delta and the cloud deck jumps.
+    timer.update();
+    lastFpsUpdate = performance.now();
+    lastAdapt = performance.now();
   });
 
   function animate() {
@@ -758,7 +830,15 @@ async function init() {
     starfield.milkyWayMaterial.uniforms.uIntensity.value = params.milkyWayIntensity;
 
     // --- Render ------------------------------------------------------------
-    composer.render();
+    // While the context is gone there is nothing to draw into, and issuing draw
+    // calls against a lost context produces an error per call.
+    if (!contextLost) composer.render();
+
+    // One clock read for the whole frame. It has to be declared before the HUD
+    // block that reads it: `const` is hoisted into the temporal dead zone, so
+    // referencing it above its declaration throws a ReferenceError on the very
+    // first frame, which the window error handler turns into the fatal overlay.
+    const nowPerf = performance.now();
 
     // --- HUD ---------------------------------------------------------------
     // These readouts are second-resolution at best, but the naive version wrote
@@ -795,7 +875,6 @@ async function init() {
 
     // --- FPS + adaptive resolution ----------------------------------------
     frameCount += 1;
-    const nowPerf = performance.now();
     if (nowPerf - lastFpsUpdate >= 500) {
       const fps = Math.round((frameCount * 1000) / (nowPerf - lastFpsUpdate));
       // Seed from the first real sample rather than a guessed 60.
@@ -828,6 +907,6 @@ async function init() {
 }
 
 init().catch((err) => {
-  reportFatal(err.message || String(err));
+  reportFatal(err.message || String(err), { blocking: true });
 });
 

@@ -268,6 +268,13 @@ body {
 }
 
 /* ---------- Fatal error overlay ---------- */
+/* ---------- Error surface ----------
+   Two very different situations, two very different treatments:
+     .blocking — nothing rendered, so the panel takes the screen and offers a
+                 reload.
+     default   — a single bad frame in a scene that is otherwise running. A
+                 full-screen black panel there destroys a working app over a
+                 transient throw, so this is a dismissible corner notice. */
 #fatal {
   position: fixed;
   inset: 0;
@@ -279,12 +286,89 @@ body {
   color: #ffb4a8;
   font-family: var(--mono);
   font-size: 12px;
-  white-space: pre-wrap;
   max-width: 100vw;
 }
 
 #fatal[hidden] {
   display: none;
+}
+
+#fatal:not(.blocking) {
+  inset: auto 12px 12px 12px;
+  place-content: start;
+  padding: 0;
+  background: transparent;
+  pointer-events: none;
+}
+
+#fatal:not(.blocking) .fatal-card {
+  pointer-events: auto;
+  max-width: 460px;
+  background: rgba(28, 10, 8, 0.92);
+  border-color: rgba(255, 138, 61, 0.42);
+}
+
+.fatal-card {
+  display: grid;
+  gap: 10px;
+  max-width: 640px;
+  padding: 16px 18px;
+  background: rgba(8, 10, 14, 0.92);
+  border: 1px solid rgba(255, 138, 61, 0.28);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+}
+
+.fatal-title {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.fatal-msg {
+  margin: 0;
+  max-height: 40vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #ffd9d0;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.fatal-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.fatal-btn {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  padding: 7px 14px;
+  border-radius: 7px;
+  cursor: pointer;
+  min-height: 32px;
+}
+
+.fatal-btn:hover {
+  background: rgba(255, 255, 255, 0.13);
+}
+
+.fatal-btn-primary {
+  border-color: rgba(255, 138, 61, 0.5);
+  background: rgba(255, 138, 61, 0.16);
+}
+
+.fatal-btn:focus-visible {
+  outline: 1px solid rgba(255, 255, 255, 0.5);
+  outline-offset: 1px;
 }
 
 @media (max-width: 640px) {
