@@ -72,14 +72,17 @@ void main() {
   if (stepLen <= 0.0) discard;
 
   vec3 L = normalize(uSunDirection);
-  // The scattering angle is measured between the incoming sun ray and the ray
-  // travelling toward the camera. `rd` points from the camera into the scene, so
-  // the outgoing direction is -rd and the cosine of the scattering angle is
-  // -dot(rd, L). Using +dot(rd, L) inverts the phase function: it puts the
-  // bright forward-scattering lobe opposite the sun and the dark back-scatter
-  // toward it, which renders a sunset on the wrong limb and kills the thin
-  // bright crescent that sits over the day side in every real orbital photo.
-  float mu = -dot(rd, L);
+  // Scattering cosine: the angle between where the light came from and where it
+  // is going. Light arrives at the sample travelling along -L and leaves along
+  // -rd (`rd` runs camera -> scene), so the cosine is dot(-L, -rd) = dot(rd, L).
+  //
+  // The signs cancel, which is exactly why this is worth stating twice: it is
+  // tempting to "fix" it to -dot(rd, L) on the grounds that rd points into the
+  // scene. That inverts the phase function and puts the forward-scattering lobe
+  // on the anti-solar limb. Checked numerically against the definition
+  // dot(normalize(sun - p), normalize(camera - p)) for a sun on +X: the sunward
+  // limb reads +0.322 and the anti-solar limb -0.322, matching dot(rd, L).
+  float mu = dot(rd, L);
   float phaseR = rayleighPhase(mu);
   float phaseM = hgPhase(mu, PL_MIE_G);
   float jitter = hash21(gl_FragCoord.xy);

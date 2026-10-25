@@ -69,6 +69,9 @@ void main() {
 
   float density;
   float relief = uCloudRelief;
+  // Advected coverage-map coordinate, kept for the relief pass below. It is the
+  // same coordinate the density came from, and cloudAdvect is not free.
+  vec2 troposphereUv = vec2(0.0);
 
   if (uLayerMode > 0.5) {
     // --- High cirrus deck ---------------------------------------------------
@@ -96,6 +99,7 @@ void main() {
     // --- Tropospheric deck from the coverage map ----------------------------
     vec2 baseUv = vUv * uCloudScale + uCloudOffset;
     vec2 cuv = cloudAdvect(baseUv, uCloudTime, uCloudDrift * uDriftScale);
+    troposphereUv = cuv;
     density = cloudDensity(uCloudsTexture, cuv);
 
     // --- Sub-texel filament detail -----------------------------------------
@@ -127,23 +131,50 @@ void main() {
   float sunVisibility = 1.0;
 
   if (relief > 0.0) {
-    vec2 baseUv = vUv * uCloudScale + uCloudOffset;
-    vec2 cuv = cloudAdvect(baseUv, uCloudTime, uCloudDrift * uDriftScale);
-
     // --- Shape from coverage gradients --------------------------------------
-    // Five extra taps here would buy a marginally better normal, and cost every
-    // fragment on the deck — this shader runs on phones. The coverage map at
-    // 4096 px already resolves individual systems, so the screen-space
-    // derivative of `density` carries the slope for free: GLSL guarantees it is
-    // available in a non-uniform-control-flow branch, and it is already
-    // computed by the rasteriser.
-    vec2 grad = vec2(dFdx(density), dFdy(density));
-    // fwidth() is the same quantity scaled to the pixel, so dividing by it
-    // normalises the slope: a cliff and a gentle swell produce the same
-    // shading, and the result is stable at any zoom level. `relief` then sets
-    // how pronounced the shape should be.
-    float gradScale = relief / max(fwidth(density), 1e-4);
-    vec3 Np = normalize(N - grad.x * gradScale * vEastW - grad.y * gradScale * vNorthW);
+    // The slope of the cloud top, in the east/north tangent plane, recovered
+    // from screen-space derivatives. Five texture taps would give the same
+    // answer and cost every fragment on the deck, so the rasteriser's
+    // derivatives are used instead — but they have to be converted, not just
+    // used directly.
+    //
+    // dFdx(density) is the change per *screen* pixel. Treating it as
+    // "change toward east" is only correct for a camera looking straight down
+    // with north up; at the limb, screen-y is radial and the normal ends up
+    // pointing in a direction that has nothing to do with the cloud's slope,
+    // and the shading of a given cloud shifts as the camera orbits. The
+    // screen-to-tangent Jacobian fixes it exactly:
+    //
+    //   dot(grad, dPdx) = dDdx      with grad = a * East + b * North
+    //   dot(grad, dPdy) = dDdy
+    //
+    // Two equations, two unknowns, no extra fetches.
+    vec3 dPdx = dFdx(vPosW);
+    vec3 dPdy = dFdy(vPosW);
+    float dDdx = dFdx(density);
+    float dDdy = dFdy(density);
+    float a11 = dot(vEastW, dPdx);
+    float a12 = dot(vNorthW, dPdx);
+    float a21 = dot(vEastW, dPdy);
+    float a22 = dot(vNorthW, dPdy);
+    float det = a11 * a22 - a12 * a21;
+
+    // One coverage texel in world units. Used to express the gradient as a
+    // rise-per-texel, which is scale-free: a cliff and a gentle swell are then
+    // told apart by their slope, not by the zoom level.
+    const float TAU = 6.2831853;
+    float texelWorld = TAU / (4096.0 * max(uCloudScale.x, 1e-3));
+
+    vec2 tilt = vec2(0.0);
+    if (abs(det) > 1e-14) {
+      float invDet = 1.0 / det;
+      float gEast = (dDdx * a22 - a12 * dDdy) * invDet;
+      float gNorth = (a11 * dDdy - dDdx * a21) * invDet;
+      tilt = clamp(vec2(gEast, gNorth) * texelWorld * relief, -1.5, 1.5);
+    }
+    // The normal leans away from the rising edge: where coverage climbs toward
+    // the east, the cloud top faces west.
+    vec3 Np = normalize(N - tilt.x * vEastW - tilt.y * vNorthW);
 
     float NdotL = dot(Np, L);
     // Light wraps a little around the puffs; a harsh Lambert term makes a
@@ -154,6 +185,7 @@ void main() {
     // Only dense cores march, which keeps clear sky and the thin veil free.
     sunVisibility = 1.0;
     if (density > 0.35) {
+      vec2 cuv = troposphereUv;
       vec2 sunUv = vec2(dot(L, vEastW), dot(L, vNorthW));
       float sunUvLen = length(sunUv);
       sunUv = sunUvLen > 1e-4 ? sunUv / sunUvLen : vec2(1.0, 0.0);
@@ -173,7 +205,11 @@ void main() {
     vec3 light = vec3(1.0, 0.985, 0.962) * uSunIntensity * sunTint;
 
     // Forward Mie scattering: the silver lining when the sun is behind a tower.
-    float phase = hgPhase(dot(V, L), 0.62);
+    // The cosine is between the arriving ray (-L) and the departing ray toward
+    // the camera (V), so it is -dot(V, L). Passing dot(V, L) peaks the lobe on
+    // the back-scattered face instead, which brightens every front-lit flank and
+    // makes the real silver lining impossible to render.
+    float phase = hgPhase(-dot(V, L), 0.62);
 
     vec3 scattered = CLOUD_ALBEDO * light * (
         wrapped * sunVisibility * 1.32
@@ -190,7 +226,7 @@ void main() {
     // is bright and almost unshaded, and simply fades out toward the limb.
     vec3 sunTint = atmosphereTransmittanceFrom(0.0041, sunUp);
     vec3 light = vec3(1.0, 0.985, 0.965) * uSunIntensity * sunTint;
-    float phase = hgPhase(dot(V, L), 0.55);
+    float phase = hgPhase(-dot(V, L), 0.55);
     float edge = pow(1.0 - clamp(density, 0.0, 1.0), 1.6);
     vec3 scattered = CLOUD_ALBEDO * light * (0.86 + phase * 1.1 * edge);
     fragColor = vec4(scattered, alpha);
