@@ -1,67 +1,130 @@
-# Orbital Earth Simulation 🌍✨
+# Orbital Earth 🌍
 
-A cinema-grade, physically based **Orbital Earth Simulation** matching NASA Blue Marble / Black Marble reference photography and high-dynamic-range (HDR) orbital renders (120 FPS target, zero placeholders, zero runtime errors).
+A physically based, real-time **Orbital Earth** render. Everything you see is solved
+per pixel from real NASA imagery and standard atmospheric physics — there is no baked
+lighting in the maps, and no placeholders anywhere in the scene.
 
-Built with **Three.js**, custom **GLSL 3.0 shaders**, and **Vite**.
-
-![Orbital Earth](https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/textures/planets/earth_atmos_2048.jpg)
-
----
-
-## 🌟 Key Features & Optical Physics
-
-### 1. 3-Sphere Planetary Architecture
-- **Planetary Surface (r = 1.000)**:
-  - **Tangent-Space Terrain Relief**: Central-differences normal perturbation on SRTM/GEBCO elevation data with grazing angle accentuation along the terminator.
-  - **Cook-Torrance GGX Specular Glint**: Realistic microfacet ocean solar reflections with Schlick-Fresnel water reflectance and cloud shadow masking.
-  - **Authentic Rayleigh Aerial Perspective**: Physical air-mass radiative transfer ($m = \frac{1}{\cos\theta + 0.06}$) providing crisp central contrast and realistic limb aerial haze.
-  - **NASA Black Marble 2016 Night Lights**: Multi-tier color spectrum (2100K sodium-vapor amber, 2700K suburban gold, 4500K LED core white) with HDR filament enhancement and cloud underglow. Pure pitch-black oceans (`#000000`).
-- **Volumetric-Feel Cloud Shell (r = 1.0022)**:
-  - **Forward Mie Scattering**: Henyey-Greenstein phase function creating radiant silver-lining coronas when backlit by the Sun.
-  - **High-Altitude Sunset Illumination**: Terminator storm clouds catch setting sunlight longer than terrain, glowing in peach and gold.
-  - **Sub-Cloud Shadows**: Sun-projected shadows cast onto the planetary surface.
-- **Outer Atmospheric Scattering Halo (r = 1.016)**:
-  - **Physical Kármán Line Scale (~102 km)**: Razor-thin, brilliant electric-cyan atmospheric skin hugging the globe.
-  - **Stratospheric Ozone Absorption**: Deep indigo/violet tint in upper layers transitioning to fiery crimson-gold along the terminator.
-
-### 2. Deep Orbital-to-City Zoom & City Intelligence Engine
-- **Logarithmic Depth Buffer**: Smooth descent from deep space (13,380 km) down to urban flight altitude (50 km) with zero near-plane clipping and zero z-fighting.
-- **Anti-Pixelation Hermite Sampling**: 4-tap continuous Hermite sub-texel filter prevents blurry square pixelation.
-- **Zoom-Adaptive Micro-Detail Synthesis**: Procedural multi-scale urban street grid arteries, micro-relief, and water ripples injected seamlessly as the camera descends.
-- **Interactive City Navigation & Fly-To**:
-  - Horizontal glass ribbon with 12 global hubs: Cairo, Riyadh, Dubai, Tokyo, New York, London, Paris, Singapore, Shanghai, Los Angeles, Rio de Janeiro, Cape Town.
-  - Smooth quintic-eased spherical camera arc transitions (`flyToCity`).
-  - Real-time telemetry cards: Coordinates, live local time, population, elevation, climate, and key landmarks.
-
-### 3. Real-Time Solar Synchronization
-- Live UTC ephemeris calculation matching the real subsolar point on Earth.
-- Manual solar override with interactive studio controls.
-- UnrealBloomPass post-processing calibrated for HDR glints without washing out continents.
+Built with **Three.js**, hand-written **GLSL ES 3.00** shaders, and **Vite**.
 
 ---
 
-## 🚀 Getting Started
+## 🌟 What the renderer actually does
 
-### Prerequisites
-- Node.js (v18+)
-- npm or yarn
+### 1. Four-layer planet
 
-### Installation
+| Layer | Radius | What it is |
+| --- | --- | --- |
+| Surface | `1.000` | land + ocean, shaded per pixel |
+| Cloud deck | `1.0022` | tropospheric clouds (~14 km) |
+| Cirrus deck | `1.0041` | procedural high ice clouds (~26 km) |
+| Atmosphere | `1.028` | single-scattering limb (~178 km) |
+
+**Surface** — the albedo map is deliberately un-lit; relief, ocean optics, cloud
+shadows and haze are all computed in the fragment shader.
+
+- Terrain relief from the SRTM/GEBCO height field (tangent-space normals, with the
+  grazing-angle accentuation that makes mountain ranges pop near the terminator).
+- **Ocean shading**: depth-stratified water colour, Schlick–Fresnel sky term
+  (gated to the day side — the night ocean stays pitch black), and a Cook–Torrance
+  GGX sun glitter whose roughness widens with altitude.
+- **Real sunlight colour**: sunlight is transmitted through the atmosphere per pixel,
+  so the terminator reddens on its own instead of being painted on.
+- **Urban detail on descent**: the Black Marble city map drives procedurally generated
+  street grids, district masks and farmland mosaic — detail appears only when a texel
+  still covers several pixels, so it never aliases.
+- **Night side**: Black Marble emission with the sensor's airglow pedestal removed,
+  cloud occlusion and the underglow that clouds over a city catch in real ISS photos.
+
+**Cloud deck** — lit like a participating medium rather than a white sprite:
+
+- Shading normal derived from the density gradient (analytic tangent frame).
+- Three-tap march toward the sun for self-shadowing, so cumulus cores fall into
+  shade and edges glow.
+- Henyey–Greenstein forward phase → silver lining when backlit.
+- Sub-texel structure fades with the screen footprint of a texel (no aliasing).
+
+**Cirrus deck** — generated on the sphere *at render time*: a second texture tap
+would inherit the source mosaic's latitude stretch and its tile seams. Fibrous,
+jet-stream-stretched, independently drifting.
+
+**Atmosphere** — a real single-scattering march:
+
+- Only rays that *miss* the planet are integrated; rays that hit the surface get
+  their airlight from the surface shader (otherwise the scattering is counted twice
+  and the disc turns milky).
+- The sample points concentrate around the ray's closest approach, because Earth's
+  atmosphere is only 0.5 % of the radius — uniform sampling steps straight over it.
+- Real Rayleigh (680/550/440 nm) and Mie coefficients with per-sample sun
+  transmittance, plus a faint O I airglow band on the night limb.
+
+### 2. Deep space
+
+- ~9 000 stars with a real spectral-class colour distribution and a power-law
+  magnitude distribution, concentrated toward the galactic plane.
+- Procedural **Milky Way** band: star clouds, dust lanes and a Sagittarius bulge.
+- Diffraction spikes only on the brightest stars; no twinkle (there is no air).
+
+### 3. Orbital-to-city navigation
+
+- Logarithmic depth buffer: 13 380 km down to 50 km with no clipping or z-fighting.
+- Quintic-eased camera arcs to 12 hubs, with live telemetry cards.
+- Click the globe near a hub to fly there, or use the ribbon.
+
+### 4. Light and smooth
+
+- HDR render target with 4× MSAA (falls back to FXAA when the GPU can't do
+  multisampled half-float).
+- Adaptive resolution: drops pixel ratio when the frame budget slips, recovers
+  when there is headroom. `?msaa=0` forces the FXAA path.
+- Shaders are precompiled during the loader, so the first frame after load is
+  already smooth.
+
+---
+
+## 🚀 Getting started
+
 ```bash
-# Clone the repository
-git clone https://github.com/YASLOGIST/orbital-earth.git
-cd orbital-earth
-
-# Install dependencies
 npm install
-
-# Start the development server (automatically checks and verifies 4K NASA textures)
-npm run dev
+npm run dev          # http://localhost:5173
 ```
 
-Open [http://localhost:5173](http://localhost:5173) in your browser.
+The dev server binds `0.0.0.0` and accepts proxied preview hosts.
 
-### Production Build
+### Textures
+
+`public/textures/` ships with five 4096×2048 maps. `predev` / `prebuild` verify
+them and skip the pipeline when they are valid:
+
+| File | Contents |
+| --- | --- |
+| `earth_day.jpg` | True-colour land albedo + neutral deep-water base |
+| `earth_night.jpg` | Black Marble emission, airglow pedestal removed |
+| `earth_specular.jpg` | Anti-aliased ocean mask |
+| `earth_topology.jpg` | Continuous height field (bathymetry + SRTM) |
+| `earth_clouds.jpg` | Cloud optical density, median-filtered |
+
+```bash
+npm run fetch-assets           # rebuild anything missing
+npm run fetch-assets -- --force  # rebuild all five
+```
+
+The cloud map is repaired during generation (5×5 median then a vertical pass) because
+the source mosaic carries salt-and-pepper noise and swath seams that are clearly
+visible from 50 km.
+
+### Verification
+
+```bash
+npm run check:shaders
+```
+
+Composes every shader the way the app does, resolves three's `#include` chunks,
+parses and validates each stage with [naga](https://github.com/gfx-rs/wgpu) (the wgpu
+shader compiler), and cross-checks that every uniform a shader declares is actually
+supplied by the JavaScript. It runs without a GPU, so it works in CI.
+
+### Production
+
 ```bash
 npm run build
 npm run preview
@@ -69,13 +132,29 @@ npm run preview
 
 ---
 
-## 🛠️ Tech Stack
-- **Three.js** (Core 3D WebGL Engine, OrbitControls, EffectComposer)
-- **GLSL 3.0** (Custom PBR surface, cloud, and halo shaders)
-- **Vite** (Next-generation frontend tooling)
-- **lil-gui** (Interactive telemetry and graphics studio controls)
+## 🎛️ Live controls (Studio panel)
+
+| Group | Controls |
+| --- | --- |
+| Solar & Ephemeris | real-UTC sync, manual sun lat/lon, intensity |
+| Atmosphere & Scattering | Rayleigh density, city emission |
+| Ocean & Terrain | sun glitter, sea roughness, wave detail, terrain detail, relief |
+| Cloud Decks | zonal drift, density, cumulus relief |
+| Orbital Dynamics | auto-spin, spin velocity |
+| Optics & Post | exposure, bloom strength/radius/threshold, stars, Milky Way |
+
+---
+
+## 🛠️ Tech stack
+
+- **Three.js** — renderer, OrbitControls, EffectComposer, UnrealBloomPass
+- **GLSL ES 3.00** — surface, cloud, atmosphere, star and Milky Way shaders
+- **Vite** — dev server and bundler
+- **lil-gui** — studio controls
+- **jpeg-js / pngjs** — the offline texture pipeline
 
 ---
 
 ## 📄 License
-MIT License. Created for high-fidelity planetary visualization.
+
+MIT.

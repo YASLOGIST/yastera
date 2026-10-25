@@ -89,7 +89,16 @@
       <div class="readout mono dim" id="fps-label"></div>
     </footer>
 
-    <div id="fatal" role="alert" hidden></div>
+    <div id="fatal" role="alert" hidden>
+      <div class="fatal-card">
+        <p class="fatal-title" id="fatal-title">Orbital Engine Error</p>
+        <pre class="fatal-msg" id="fatal-msg"></pre>
+        <div class="fatal-actions">
+          <button type="button" id="fatal-reload" class="fatal-btn fatal-btn-primary">Reload</button>
+          <button type="button" id="fatal-dismiss" class="fatal-btn">Dismiss</button>
+        </div>
+      </div>
+    </div>
 
     <script type="module" src="/src/main.js"></script>
   </body>
