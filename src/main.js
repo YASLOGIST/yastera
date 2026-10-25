@@ -57,10 +57,27 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 
+/**
+ * Reads the `// program: <key>` breadcrumb that `composeShader` prepends, so a
+ * driver error names the program instead of only its line number.
+ */
+function programNameOf(gl, shader) {
+  try {
+    const source = gl.getShaderSource(shader) || '';
+    const match = source.match(/^\/\/ program: (\w+)/m);
+    return match ? match[1] : 'unknown program';
+  } catch {
+    return 'unknown program';
+  }
+}
+
 renderer.debug.onShaderError = (gl, program, glVertexShader, glFragmentShader) => {
-  const vLog = gl.getShaderInfoLog(glVertexShader);
-  const fLog = gl.getShaderInfoLog(glFragmentShader);
-  reportFatal(`Shader Compile Error:\nVertex:\n${vLog}\n\nFragment:\n${fLog}`);
+  const vLog = (gl.getShaderInfoLog(glVertexShader) || '').trim();
+  const fLog = (gl.getShaderInfoLog(glFragmentShader) || '').trim();
+  const sections = ['Shader compile failed'];
+  if (vLog) sections.push(`vertex — ${programNameOf(gl, glVertexShader)}\n${vLog}`);
+  if (fLog) sections.push(`fragment — ${programNameOf(gl, glFragmentShader)}\n${fLog}`);
+  reportFatal(sections.join('\n\n'));
 };
 
 const scene = new THREE.Scene();

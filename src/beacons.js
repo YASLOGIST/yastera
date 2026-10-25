@@ -2,8 +2,10 @@ import * as THREE from 'three';
 
 import { latLngToVector3 } from './geo.js';
 import { CITIES } from './cities.js';
-import beaconVert from './shaders/beacon.vert?raw';
-import beaconFrag from './shaders/beacon.frag?raw';
+import { SHADERS } from './shaderSources.js';
+
+const beaconVert = SHADERS.beaconVertex;
+const beaconFrag = SHADERS.beacon;
 
 export const HUBS = CITIES;
 

@@ -1,18 +1,16 @@
 #!/usr/bin/env node
 /**
- * Shader + wiring checker.
+ * Shader + wiring checker. Runs without a GPU.
  *
- * Runs without a GPU:
- *   1. Composes each shader the way earth.js does (lib prelude + source) and
- *      resolves three's `#include <chunk>` directives.
- *   2. Parses and validates every stage with naga (the wgpu shader compiler),
+ *   1. Composes every program from `src/shaderManifest.js` — the exact same
+ *      table `src/shaderSources.js` uses at runtime, so the checker can never
+ *      validate a prelude the app forgets to attach.
+ *   2. Resolves three's `#include <chunk>` directives.
+ *   3. Parses and validates each stage with naga (the wgpu shader compiler),
  *      which catches undefined identifiers, type errors, bad swizzles, wrong
  *      call signatures and illegal control flow.
- *   3. Cross-checks every uniform a shader declares against the uniforms the
- *      JS actually supplies, for each material.
- *
- * The naga path needs the optional dev dependencies; without them only the
- * uniform cross-check runs (still useful in CI, no download required).
+ *   4. Cross-checks every uniform a shader declares against the uniforms its
+ *      owning JS module supplies.
  *
  * Usage: npm run check:shaders
  */
@@ -20,21 +18,18 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import {
+  SHADER_STAGES,
+  SHADER_OWNERS,
+  composeShader,
+} from '../src/shaderManifest.js';
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const SHADER_DIR = path.join(ROOT, 'src/shaders');
 const read = (p) => readFileSync(path.join(ROOT, p), 'utf8');
-const lib = (n) => read(`src/shaders/lib/${n}`);
+const readShaderPart = (part) => readFileSync(path.join(SHADER_DIR, part), 'utf8');
 
-const PRELUDE = lib('noise.glsl') + lib('atmosphere.glsl') + lib('clouds.glsl');
-
-/** Triple of { material name, fragment source, vertex source, JS owner }. */
-const MATERIALS = [
-  { name: 'earthSurface', frag: PRELUDE + read('src/shaders/earthSurface.frag'), vert: read('src/shaders/earthSurface.vert'), js: 'src/earth.js' },
-  { name: 'earthClouds', frag: PRELUDE + read('src/shaders/earthClouds.frag'), vert: read('src/shaders/cloud.vert'), js: 'src/earth.js' },
-  { name: 'atmosphereHalo', frag: lib('atmosphere.glsl') + read('src/shaders/atmosphereHalo.frag'), vert: read('src/shaders/shell.vert'), js: 'src/earth.js' },
-  { name: 'starfield', frag: read('src/shaders/starfield.frag'), vert: read('src/shaders/starfield.vert'), js: 'src/starfield.js' },
-  { name: 'milkyWay', frag: lib('noise.glsl') + read('src/shaders/milkyway.frag'), vert: read('src/shaders/milkyway.vert'), js: 'src/starfield.js' },
-  { name: 'beacon', frag: read('src/shaders/beacon.frag'), vert: read('src/shaders/beacon.vert'), js: 'src/beacons.js' },
-];
+const PROGRAMS = Object.keys(SHADER_STAGES);
 
 const BUILTINS = new Set([
   'modelMatrix', 'modelViewMatrix', 'projectionMatrix', 'viewMatrix', 'normalMatrix',
@@ -42,7 +37,7 @@ const BUILTINS = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// 1. three.js #include resolution
+// three.js #include resolution
 // ---------------------------------------------------------------------------
 const CHUNK_DIR = path.join(ROOT, 'node_modules/three/src/renderers/shaders/ShaderChunk');
 
@@ -59,7 +54,7 @@ function resolveIncludes(src) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Uniform contract
+// Uniform contract
 // ---------------------------------------------------------------------------
 function declaredUniforms(src) {
   const names = new Set();
@@ -77,13 +72,13 @@ function suppliedUniforms(jsFile) {
 
 function checkUniformContract() {
   let problems = 0;
-  for (const mat of MATERIALS) {
-    const supplied = suppliedUniforms(mat.js);
-    const need = new Set([...declaredUniforms(mat.frag), ...declaredUniforms(mat.vert)]);
-    for (const name of need) {
+  for (const [program, jsFile] of Object.entries(SHADER_OWNERS)) {
+    const supplied = suppliedUniforms(jsFile);
+    const source = composeShader(readShaderPart, program);
+    for (const name of declaredUniforms(source)) {
       if (BUILTINS.has(name)) continue;
       if (!supplied.has(name)) {
-        console.error(`  ✖ ${mat.name}: shader declares "${name}" but ${mat.js} never supplies it`);
+        console.error(`  ✖ ${program}: shader declares "${name}" but ${jsFile} never supplies it`);
         problems += 1;
       }
     }
@@ -92,7 +87,7 @@ function checkUniformContract() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Semantic validation with naga
+// Semantic validation with naga
 // ---------------------------------------------------------------------------
 async function checkWithNaga() {
   let naga;
@@ -104,7 +99,7 @@ async function checkWithNaga() {
   }
 
   // naga insists on explicit binding points for every uniform block.
-  const VERT_PREFIX = `layout(binding=40, std140) uniform BuiltinV { mat4 modelMatrix; };
+  const VERT_PREFIX = `layout(binding=40, std140) uniform BuiltinV0 { mat4 modelMatrix; };
 layout(binding=41, std140) uniform BuiltinV1 { mat4 modelViewMatrix; };
 layout(binding=42, std140) uniform BuiltinV2 { mat4 projectionMatrix; };
 layout(binding=43, std140) uniform BuiltinV3 { mat4 viewMatrix; };
@@ -115,7 +110,7 @@ in vec3 normal;
 in vec2 uv;
 in vec4 tangent;
 `;
-  const FRAG_PREFIX = `layout(binding=40, std140) uniform BuiltinF { mat4 viewMatrix; };
+  const FRAG_PREFIX = `layout(binding=40, std140) uniform BuiltinF0 { mat4 viewMatrix; };
 layout(binding=41, std140) uniform BuiltinF1 { vec3 cameraPosition; };
 layout(binding=42, std140) uniform BuiltinF2 { float logDepthBufFC; };
 `;
@@ -161,17 +156,18 @@ layout(binding=42, std140) uniform BuiltinF2 { float logDepthBufFC; };
   }
 
   let problems = 0;
-  for (const mat of MATERIALS) {
-    for (const [stage, src] of [['vertex', mat.vert], ['fragment', mat.frag]]) {
-      try {
-        const module = naga.parseGlsl(prepare(src, stage), { stage });
-        const info = naga.validate(module);
-        module.free?.();
-        info.free?.();
-      } catch (err) {
-        console.error(`  ✖ ${mat.name} (${stage}):\n${(err.formatted || err.message || err).split('\n').slice(0, 12).join('\n')}`);
-        problems += 1;
-      }
+  for (const program of PROGRAMS) {
+    const source = composeShader(readShaderPart, program);
+    const stage = SHADER_STAGES[program];
+    try {
+      const module = naga.parseGlsl(prepare(source, stage), { stage });
+      const info = naga.validate(module);
+      module.free?.();
+      info.free?.();
+    } catch (err) {
+      console.error(`  ✖ ${program} (${stage}):`);
+      console.error((err.formatted || err.message || String(err)).split('\n').slice(0, 14).join('\n'));
+      problems += 1;
     }
   }
   return problems;
@@ -183,5 +179,5 @@ if (problems > 0) {
   console.error(`\n${problems} shader problem(s) found.`);
   process.exitCode = 1;
 } else {
-  console.log('✓ all shaders parse, validate, and match their uniform contracts.');
+  console.log(`✓ ${PROGRAMS.length} shader programs parse, validate, and match their uniform contracts.`);
 }

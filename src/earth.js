@@ -1,23 +1,15 @@
 import * as THREE from 'three';
 
-import surfaceVert from './shaders/earthSurface.vert?raw';
-import surfaceFragSource from './shaders/earthSurface.frag?raw';
-import cloudVert from './shaders/cloud.vert?raw';
-import cloudsFragSource from './shaders/earthClouds.frag?raw';
-import shellVert from './shaders/shell.vert?raw';
-import haloFragSource from './shaders/atmosphereHalo.frag?raw';
+import { SHADERS } from './shaderSources.js';
 
-import noiseLib from './shaders/lib/noise.glsl?raw';
-import atmosphereLib from './shaders/lib/atmosphere.glsl?raw';
-import cloudsLib from './shaders/lib/clouds.glsl?raw';
-
-// Shared prelude: procedural noise, scattering physics, cloud deck helpers.
-// Concatenated in dependency order — `?raw` keeps the GLSL authored as real
-// .glsl files while Vite still gives us dead-simple bundling.
-const PRELUDE = `${noiseLib}\n${atmosphereLib}\n${cloudsLib}\n`;
-const surfaceFrag = PRELUDE + surfaceFragSource;
-const cloudsFrag = PRELUDE + cloudsFragSource;
-const haloFrag = `${atmosphereLib}\n${haloFragSource}`;
+// Sources are composed in `shaderManifest.js` so the offline checker validates
+// byte-for-byte what this module compiles.
+const surfaceVert = SHADERS.earthSurfaceVertex;
+const surfaceFrag = SHADERS.earthSurface;
+const cloudVert = SHADERS.cloudShellVertex;
+const cloudsFrag = SHADERS.cloudShell;
+const shellVert = SHADERS.shellVertex;
+const haloFrag = SHADERS.atmosphereHalo;
 
 export const EARTH_RADIUS = 1.0;
 export const CLOUD_RADIUS = 1.0022;        // ~14 km: main tropospheric deck

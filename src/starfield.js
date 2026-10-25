@@ -1,9 +1,14 @@
 import * as THREE from 'three';
 
-import starVert from './shaders/starfield.vert?raw';
-import starFrag from './shaders/starfield.frag?raw';
-import milkyWayVert from './shaders/milkyway.vert?raw';
-import milkyWayFrag from './shaders/milkyway.frag?raw';
+import { SHADERS } from './shaderSources.js';
+
+// NOTE: the Milky Way fragment needs the procedural noise prelude from
+// lib/noise.glsl (fbm4 / valueNoise). Composition lives in shaderManifest.js so
+// that requirement cannot be forgotten here.
+const starVert = SHADERS.starfieldVertex;
+const starFrag = SHADERS.starfield;
+const milkyWayVert = SHADERS.milkyWayVertex;
+const milkyWayFrag = SHADERS.milkyWay;
 
 /**
  * Realistic stellar colour ladder (linear RGB), sampled by spectral class.
