@@ -318,7 +318,11 @@ void main() {
   // aerosol and multiple scattering, which is why it is larger than a naive
   // single-scatter optical depth would be.
   float airMass = relativeAirMass(cosV);
-  float haze = 1.0 - exp(-airMass * 0.16);
+  // 0.10 rather than 0.16: Rayleigh optical depth at 550 nm for a vertical path
+  // is about 0.10. The larger value made the haze grow 6.8x from nadir to limb
+  // where the physics gives 10.5x, so it was too strong low down and too weak
+  // at the limb at the same time.
+  float haze = 1.0 - exp(-airMass * 0.10);
   vec3 sunPath = atmosphereTransmittanceFrom(0.0, sunUp);
 
   // Twilight: the air column is still sunlit after the ground has gone dark.
@@ -333,7 +337,26 @@ void main() {
   hazeTint = mix(hazeTint, vec3(0.86, 0.52, 0.34), viewTwilight * 0.35);
 
   float hazeAmount = haze * 0.62 * smoothstep(-0.09, 0.09, sunUp) * uAtmosphereIntensity;
-  color = color * (1.0 - hazeAmount * 0.55) + hazeAmount * hazeTint * sunPath * 0.9;
+
+  // AIRLIGHT_BRIGHTNESS is the radiance of the in-scattered sky, in units where
+  // a white Lambertian surface at normal incidence reads 1.0.
+  //
+  // Single-scattered Rayleigh path radiance is
+  //   L = (E / 4pi) * (1 - T) * P(theta),  P(90deg) = 0.75,
+  // and E = pi when a white surface reads 1.0, so a zenith view gives
+  //   L = 0.25 * 0.0952 * 0.75 = 0.0178,
+  // and the limb, where T -> 0, gives 0.25 * 0.75 = 0.188.
+  //
+  // 0.62 * 0.63 * 0.48 = 0.188 reproduces both ends. This used to be 0.9 — a
+  // sky roughly five times brighter than any Rayleigh atmosphere — and the cost
+  // was every warm surface reading as taupe: measured on the Sahara, blue was
+  // lifted from 0.100 to 0.137 linear while red dropped 12 %, turning ochre sand
+  // grey-olive. The same term is a 45 % lift on the open ocean and a 5 % lift on
+  // sunlit sand, which is exactly why the ocean looked milky and the desert
+  // looked muddy at the same time.
+  const float AIRLIGHT_BRIGHTNESS = 0.48;
+  color = color * (1.0 - hazeAmount * 0.55)
+        + hazeAmount * hazeTint * sunPath * AIRLIGHT_BRIGHTNESS;
 
   fragColor = vec4(color, 1.0);
 }
