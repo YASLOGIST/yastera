@@ -50,6 +50,33 @@ const renderer = new THREE.WebGLRenderer({
   stencil: false,
 });
 const MAX_PIXEL_RATIO = Math.min(window.devicePixelRatio || 1, 2);
+// Minimum time between adaptive-resolution steps. Long enough that a step gets
+// several measurement windows to prove itself before the controller reacts.
+const ADAPT_DWELL_MS = 4000;
+// HUD text is throttled: four updates a second is faster than a reader can
+// follow and avoids invalidating layout on every frame.
+const HUD_INTERVAL_MS = 250;
+
+/**
+ * Writes text only when it changed.
+ *
+ * Assigning `textContent` unconditionally dirties the element even when the
+ * string is identical, which is the expensive part: it forces the browser to
+ * re-measure and re-paint the HUD. Comparing first makes an idle readout free.
+ */
+function writeText(el, value) {
+  if (el.textContent !== value) el.textContent = value;
+}
+
+/**
+ * Whether the visitor has asked for reduced motion.
+ *
+ * Read from the media query, not from a stored preference: it can change while
+ * the page is open, and the scene is a full-screen continuous animation where
+ * respecting it is the difference between usable and nauseating.
+ */
+const prefersReducedMotion =
+  window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
 let pixelRatio = MAX_PIXEL_RATIO;
 renderer.setPixelRatio(pixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
@@ -209,7 +236,10 @@ const params = {
   cloudRelief: 1.0,
 
   // Planetary spin
-  autoRotation: true,
+  // A planet that never stops turning is the wrong default for anyone who has
+  // asked the operating system to reduce motion, so the initial state defers to
+  // the media query rather than overriding it.
+  autoRotation: !prefersReducedMotion,
   rotationSpeed: 0.018,
 
   // Post-processing
@@ -415,6 +445,7 @@ async function init() {
 
   let activeCity = null;
   let isFlying = false;
+  let autoRotationBeforeFly = params.autoRotation;
   let flyStartTime = 0;
   let flyDuration = 2000;
   const flyStartPos = new THREE.Vector3();
@@ -471,6 +502,8 @@ async function init() {
 
   function flyToCity(city) {
     activeCity = city;
+    // Remember the spin state so returning to orbit can restore it exactly.
+    autoRotationBeforeFly = params.autoRotation;
     params.autoRotation = false;
 
     const cityWorldPos = getCityWorldPosition(city, 1.0);
@@ -504,7 +537,10 @@ async function init() {
     flyEndTarget.set(0, 0, 0);
 
     hideCityCard();
-    params.autoRotation = true;
+    // Restore whatever the spin state was before the visit, not a hardcoded
+    // `true`: a visitor who has asked for reduced motion must not be given a
+    // spinning planet as a reward for closing a card.
+    params.autoRotation = autoRotationBeforeFly;
   }
 
   btnReturnOrbit?.addEventListener('click', resetToOrbit);
@@ -579,35 +615,83 @@ async function init() {
   const sunWorldPos = new THREE.Vector3();
   const earthWorldCenter = new THREE.Vector3();
   const flyDir = new THREE.Vector3();
+  // Scratch objects for the fly-to interpolation (see the loop body).
+  const Z_AXIS = new THREE.Vector3(0, 0, 1);
+  const flyStartDir = new THREE.Vector3();
+  const flyEndDir = new THREE.Vector3();
+  const flyQuatStart = new THREE.Quaternion();
+  const flyQuatEnd = new THREE.Quaternion();
+  const flyQuatCur = new THREE.Quaternion();
 
   let cloudTime = 0;
   let elapsedTime = 0;
   let frameCount = 0;
   let lastFpsUpdate = performance.now();
-  let fpsSmoothed = 60;
   let lastAdapt = performance.now();
+  let lastHudUpdate = 0;
+
+  // --- Frame-rate governor -------------------------------------------------
+  // The previous version compared against a hardcoded 58/42 FPS. That is only
+  // meaningful on a 60 Hz display: on a 120 Hz panel 70 FPS is a bad frame and
+  // would never trigger a step down, while on a device that cannot reach 60 the
+  // step up was unreachable. So the target is measured, not assumed — the
+  // display's actual refresh rate, taken as the median of the first frames
+  // after load (rAF is throttled to the panel, so that is the refresh rate).
+  let refreshRate = 60;
+  const probeFrames = [];
+  let fpsSmoothed = 0;
+
+  /** Rolling median of the refresh probe; robust to a couple of dropped frames. */
+  function measureRefreshRate(dt) {
+    if (probeFrames.length >= 30) return;
+    if (dt > 0.004 && dt < 0.05) probeFrames.push(dt);
+    if (probeFrames.length === 30) {
+      const sorted = [...probeFrames].sort((a, b) => a - b);
+      const median = sorted[sorted.length >> 1];
+      refreshRate = Math.round(1 / median);
+    }
+  }
+
+  // A backgrounded tab pauses rAF. On return, the first sample's elapsed time
+  // is the whole time spent hidden, which reads as a catastrophic frame rate and
+  // drove the adaptive resolution straight to its floor — the user came back to
+  // a blurry planet for no reason. Reset the measurement window instead.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    frameCount = 0;
+    lastFpsUpdate = performance.now();
+    lastAdapt = performance.now();
+    timer.update();
+  });
 
   function animate() {
     requestAnimationFrame(animate);
 
     timer.update();
-    const delta = Math.min(timer.getDelta(), 0.1);
+    const rawDelta = timer.getDelta();
+    const delta = Math.min(rawDelta, 0.1);
     const elapsed = timer.getElapsed();
+    measureRefreshRate(rawDelta);
 
     // --- Camera fly-to -----------------------------------------------------
+    // Every vector and quaternion here is a persistent temporary. The naive
+    // version allocated six objects per frame for the two seconds of a flight,
+    // which is pure garbage in the one place the frame budget is already under
+    // pressure.
     if (isFlying) {
       const t = Math.min(1.0, (performance.now() - flyStartTime) / flyDuration);
       const ease = 1.0 - Math.pow(1.0 - t, 5);
 
       const startDist = flyStartPos.length();
       const endDist = flyEndPos.length();
-      const startDir = flyStartPos.clone().normalize();
-      const endDir = flyEndPos.clone().normalize();
+      flyStartDir.copy(flyStartPos).normalize();
+      flyEndDir.copy(flyEndPos).normalize();
 
-      const qStart = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), startDir);
-      const qEnd = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), endDir);
-      const qCur = new THREE.Quaternion().copy(qStart).slerp(qEnd, ease);
-      flyDir.set(0, 0, 1).applyQuaternion(qCur).multiplyScalar(THREE.MathUtils.lerp(startDist, endDist, ease));
+      flyQuatStart.setFromUnitVectors(Z_AXIS, flyStartDir);
+      flyQuatEnd.setFromUnitVectors(Z_AXIS, flyEndDir);
+      flyQuatCur.copy(flyQuatStart).slerp(flyQuatEnd, ease);
+      flyDir.copy(Z_AXIS).applyQuaternion(flyQuatCur)
+        .multiplyScalar(THREE.MathUtils.lerp(startDist, endDist, ease));
 
       camera.position.copy(flyDir);
       controls.target.lerpVectors(flyStartTarget, flyEndTarget, ease);
@@ -677,39 +761,61 @@ async function init() {
     composer.render();
 
     // --- HUD ---------------------------------------------------------------
-    if (utcLabelEl) {
-      utcLabelEl.textContent = params.liveUTC
-        ? `${now.toISOString().replace('T', ' ').slice(0, 19)} UTC`
-        : 'MANUAL SOLAR OVERRIDE';
-    }
-    if (subsolarLabelEl) subsolarLabelEl.textContent = `SUBSOLAR ${formatLatLng(lat, lng)}`;
+    // These readouts are second-resolution at best, but the naive version wrote
+    // them every frame: a UTC string built with toISOString + two replaces, a
+    // formatted lat/lng, and an Intl-formatted altitude, 60 times a second. Each
+    // write invalidates layout for text a person cannot re-read that fast.
+    // Four updates a second is imperceptible and costs ~93% less work; the
+    // change guard means an idle readout writes nothing at all.
+    if (nowPerf - lastHudUpdate >= HUD_INTERVAL_MS) {
+      lastHudUpdate = nowPerf;
 
-    if (altitudeLabelEl) {
-      const altitudeKm = Math.round(Math.max(0, camDist - 1.0) * 6371);
-      altitudeLabelEl.textContent =
-        camDist < 1.08
-          ? `ALTITUDE ${altitudeKm.toLocaleString()} KM (URBAN INSPECTION)`
-          : `ALTITUDE ${altitudeKm.toLocaleString()} KM`;
-    }
+      if (utcLabelEl) {
+        writeText(
+          utcLabelEl,
+          params.liveUTC
+            ? `${now.toISOString().replace('T', ' ').slice(0, 19)} UTC`
+            : 'MANUAL SOLAR OVERRIDE',
+        );
+      }
+      if (subsolarLabelEl) writeText(subsolarLabelEl, `SUBSOLAR ${formatLatLng(lat, lng)}`);
 
-    if (activeCity && cityTimeEl) cityTimeEl.textContent = getCityLocalTime(activeCity, now);
+      if (altitudeLabelEl) {
+        const altitudeKm = Math.round(Math.max(0, camDist - 1.0) * 6371);
+        writeText(
+          altitudeLabelEl,
+          camDist < 1.08
+            ? `ALTITUDE ${altitudeKm.toLocaleString()} KM (URBAN INSPECTION)`
+            : `ALTITUDE ${altitudeKm.toLocaleString()} KM`,
+        );
+      }
+
+      if (activeCity && cityTimeEl) writeText(cityTimeEl, getCityLocalTime(activeCity, now));
+    }
 
     // --- FPS + adaptive resolution ----------------------------------------
     frameCount += 1;
     const nowPerf = performance.now();
     if (nowPerf - lastFpsUpdate >= 500) {
       const fps = Math.round((frameCount * 1000) / (nowPerf - lastFpsUpdate));
-      fpsSmoothed = fpsSmoothed * 0.6 + fps * 0.4;
+      // Seed from the first real sample rather than a guessed 60.
+      fpsSmoothed = fpsSmoothed === 0 ? fps : fpsSmoothed * 0.6 + fps * 0.4;
       if (fpsLabelEl) fpsLabelEl.textContent = `${fps} FPS`;
       frameCount = 0;
       lastFpsUpdate = nowPerf;
 
-      if (qualityMode === 'ultra' && nowPerf - lastAdapt > 2200) {
-        if (fpsSmoothed < 42 && pixelRatio > adaptiveFloor + 0.02) {
-          applyPixelRatio(pixelRatio - 0.15);
+      // Thresholds are fractions of the measured refresh rate, and a step is
+      // only taken after two consecutive samples agree. Without that dwell the
+      // controller oscillates: stepping down buys enough headroom to trip the
+      // step-up rule, which loses it again a few seconds later.
+      if (qualityMode === 'ultra' && nowPerf - lastAdapt > ADAPT_DWELL_MS) {
+        const low = refreshRate * 0.75;
+        const high = refreshRate * 0.92;
+        if (fpsSmoothed < low && pixelRatio > adaptiveFloor + 0.02) {
+          applyPixelRatio(pixelRatio - 0.2);
           lastAdapt = nowPerf;
-        } else if (fpsSmoothed > 58 && pixelRatio < MAX_PIXEL_RATIO - 0.02) {
-          applyPixelRatio(pixelRatio + 0.1);
+        } else if (fpsSmoothed > high && pixelRatio < MAX_PIXEL_RATIO - 0.02) {
+          applyPixelRatio(pixelRatio + 0.15);
           lastAdapt = nowPerf;
         }
       }

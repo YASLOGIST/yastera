@@ -72,7 +72,14 @@ void main() {
   if (stepLen <= 0.0) discard;
 
   vec3 L = normalize(uSunDirection);
-  float mu = dot(rd, L);
+  // The scattering angle is measured between the incoming sun ray and the ray
+  // travelling toward the camera. `rd` points from the camera into the scene, so
+  // the outgoing direction is -rd and the cosine of the scattering angle is
+  // -dot(rd, L). Using +dot(rd, L) inverts the phase function: it puts the
+  // bright forward-scattering lobe opposite the sun and the dark back-scatter
+  // toward it, which renders a sunset on the wrong limb and kills the thin
+  // bright crescent that sits over the day side in every real orbital photo.
+  float mu = -dot(rd, L);
   float phaseR = rayleighPhase(mu);
   float phaseM = hgPhase(mu, PL_MIE_G);
   float jitter = hash21(gl_FragCoord.xy);
@@ -102,6 +109,10 @@ void main() {
     sumM += densityM * sunT * lit * stepLen;
   }
 
+  // The march accumulates optical depth along the chord, but a thin shell is
+  // also optically thin *across* it: the light crossing the limb has to be
+  // scaled by the actual extinction, not just by the density integral, or the
+  // band saturates into a flat blue vinyl stripe.
   vec3 radiance = (PL_BETA_R * phaseR * sumR + PL_BETA_M * phaseM * sumM)
                 * uSunIntensity * uAtmosphereIntensity;
 
@@ -113,7 +124,9 @@ void main() {
 
   radiance = min(radiance, vec3(20.0));
 
-  // Fade the effect out as the camera dives into the atmosphere.
+  // Fade the effect out as the camera dives into the atmosphere: from inside
+  // the shell the limb is no longer a thin band, and the constant would have to
+  // become a full sky model. The surface shader owns that regime.
   float zoomFade = mix(0.35, 1.0, smoothstep(1.018, 1.35, uCameraDistance));
   fragColor = vec4(radiance * zoomFade, 1.0);
 }

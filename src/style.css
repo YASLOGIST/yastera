@@ -140,6 +140,9 @@ body {
 .segmented button {
   padding: 4px 12px;
   border-radius: 999px;
+  /* WCAG 2.2 target size (minimum) is 24x24 CSS px; this meets it with margin.
+     The padding below expands to 44px hit area on touch devices. */
+  min-height: 24px;
 }
 
 .segmented button[aria-checked='true'] {
@@ -292,13 +295,6 @@ body {
   .hud-bottom {
     left: 14px;
     bottom: 14px;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  #loader,
-  .loader-bar {
-    transition: none;
   }
 }
 
@@ -546,3 +542,44 @@ body {
   transform: translateY(-1px);
 }
 
+
+
+/* ---------- Touch targets ----------
+   A 28 px chip is fine for a mouse and bad for a thumb. On coarse pointers the
+   interactive elements grow to the 44 px minimum recommended by WCAG 2.2
+   (Target Size, Enhanced) without changing the desktop layout at all. */
+@media (pointer: coarse) {
+  .segmented button,
+  .icon-button {
+    min-height: 44px;
+    min-width: 44px;
+  }
+  .city-chip {
+    height: 40px;
+    padding: 0 16px;
+  }
+  .city-card-close {
+    width: 44px;
+    height: 44px;
+  }
+  .btn-orbit {
+    height: 44px;
+  }
+}
+
+/* Honour the OS motion preference for the whole HUD, not just the loader:
+   the chip hover lift and the card transition are the two animated surfaces a
+   user actually notices. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .city-chip:hover {
+    transform: none;
+  }
+}

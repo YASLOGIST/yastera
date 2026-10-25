@@ -101,8 +101,19 @@ void main() {
   vec2 landSlope = relief * (0.0049 / cosLat) * uBumpScale;
 
   // --- Wind-sea slope (visible only as the camera descends) ----------------
-  float waveAmp = mix(0.0, 0.22, zoom) * uWaveStrength;
-  float waveFreq = mix(14.0, 2200.0, zoom * zoom);
+  // Two things have to be true for waves to look real and stay stable.
+  //
+  // First, amplitude rises with zoom: from orbit a 2 m swell is far below one
+  // texel and contributes nothing but aliasing.
+  //
+  // Second — and this is what a naive wave function gets wrong — amplitude must
+  // fall again once the *wavelength* approaches the pixel footprint. Otherwise
+  // the highest-frequency trains of the sum turn into crawling sparkle noise the
+  // moment the camera stops, and no amount of temporal smoothing fixes it
+  // because it is a sampling failure, not a motion one.
+  float waveFreq = mix(14.0, 1200.0, zoom * zoom);
+  float waveLod = 1.0 - smoothstep(0.10, 0.45, fwidth(uv.x) * waveFreq);
+  float waveAmp = mix(0.0, 0.22, zoom) * uWaveStrength * waveLod;
   vec2 seaSlope = windSeaSlope(uv, waveFreq, waveAmp, uTime);
 
   vec3 N = normalize(Ng - (landSlope.x * T + landSlope.y * B) * land);
@@ -218,16 +229,29 @@ void main() {
   vec3 skyAmbient = light * vec3(0.10, 0.16, 0.30) * 0.20;
   color += albedo * skyAmbient * smoothstep(-0.03, 0.22, sunUp);
 
-  // --- Ocean: Fresnel sky reflection --------------------------------------
+  // --- Ocean: reflected sky -----------------------------------------------
+  // Fresnel only says how much light is reflected; it says nothing about what
+  // is being reflected. A constant tint therefore makes every sea the same blue
+  // no matter where the sun is, which is the single clearest giveaway of a fake
+  // ocean. Here the reflected ray is actually traced into an analytic sky:
+  // zenith-to-horizon gradient, plus the forward Mie glow that puts a bright
+  // patch under the sun.
   float cosV = clamp(dot(Ng, V), 1e-4, 1.0);
   float fresnel = 0.02 + 0.98 * pow(1.0 - cosV, 5.0);
-  vec3 skyTint = vec3(0.26, 0.46, 0.86);
-  vec3 skyReflection = light * skyTint * 0.55;
+  vec3 Rf = reflect(-V, Ns);
+  float skyCos = clamp(dot(Rf, Ng), 0.0, 1.0);
+  // Downwelling sky is deep blue overhead and pales toward the horizon, where
+  // the view path is long enough to pick up aerosol.
+  vec3 zenithSky  = vec3(0.045, 0.135, 0.380);
+  vec3 horizonSky = vec3(0.400, 0.560, 0.860);
+  vec3 skyRadiance = mix(horizonSky, zenithSky, pow(skyCos, 0.55));
+  float sunGlow = pow(max(dot(Rf, L), 0.0), 8.0);
+  skyRadiance += vec3(1.0, 0.86, 0.66) * sunGlow * 1.5;
   float waterVisible = water * (1.0 - cloud * 0.75);
   // Only the sunlit hemisphere has a sky to reflect: without this gate the
   // night oceans glow blue from reflected "daylight" that is not there.
   float skyGate = smoothstep(-0.09, 0.10, sunUp);
-  color += skyReflection * fresnel * waterVisible * shadowFactor * skyGate;
+  color += skyRadiance * light * fresnel * waterVisible * shadowFactor * skyGate;
 
   // --- Ocean: GGX sun glitter ---------------------------------------------
   // Roughness widens with altitude: from orbit the glitter is a long anisotropic
@@ -244,16 +268,31 @@ void main() {
   vec3 specular = (D * G * Fw) / max(4.0 * cosV * NdotLs, 1e-3);
   specular = min(specular, vec3(90.0));
 
-  float glintMask = waterVisible * smoothstep(0.0, 0.055, sunUp);
+  // A cloud shadow darkens the sun glitter too: a specular highlight without
+  // the direct beam is light from nowhere, and it was visible as sparkling
+  // water inside cloud shadows.
+  float glintMask = waterVisible * smoothstep(0.0, 0.055, sunUp) * shadowFactor;
   vec3 glintTint = mix(vec3(1.0, 0.82, 0.60), vec3(1.0, 0.98, 0.94), smoothstep(0.02, 0.35, sunUp));
   color += specular * light * glintTint * glintMask * uSpecularIntensity;
 
-  // --- Coastal surf (only at urban-inspection altitude) --------------------
-  if (zoom > 0.30) {
-    float band = smoothstep(0.26, 0.44, waterRaw) * (1.0 - smoothstep(0.52, 0.66, waterRaw));
-    float surf = fbm4(uv * vec2(8200.0, 4100.0) + vec2(uTime * 0.05, 0.0));
-    float foam = band * smoothstep(0.46, 0.78, surf) * smoothstep(0.30, 0.95, zoom);
-    color += vec3(0.80, 0.88, 0.94) * light * foam * 0.55 * shadowFactor;
+  // --- Whitecaps ----------------------------------------------------------
+  // Crests of the steepest waves break and entrain air. There is no wind field
+  // to drive this, but the slope already computed is a fair proxy: steep water
+  // *is* breaking water. Gated to close range — a whitecap is ~10 m across and
+  // is pure noise from orbit.
+  //
+  // Note there is deliberately no white band painted along the coastline. An
+  // earlier version drew one from the water mask, and because that mask is
+  // 10 km per texel the band was ten kilometres wide on every shore on Earth:
+  // it read as a bright cyan rim around every continent, which is exactly what
+  // a coast does not look like from space. Surf is a hundred metres wide and
+  // simply does not survive this texture resolution, so leaving it out is more
+  // truthful than faking it at the wrong scale.
+  if (zoom > 0.45) {
+    float crest = clamp(length(seaSlope) * 2.4 - 0.55, 0.0, 1.0);
+    float caps = fbm4(uv * vec2(7600.0, 3800.0) + vec2(uTime * 0.018, uTime * 0.004));
+    float foam = smoothstep(0.52, 0.90, crest * (0.45 + caps)) * smoothstep(0.45, 0.90, zoom);
+    color = mix(color, vec3(0.90, 0.93, 0.97) * light * NdotLs, foam * water * 0.75);
   }
 
   // --- Night side: Black Marble city emission -----------------------------
@@ -285,6 +324,13 @@ void main() {
   // Twilight: the air column is still sunlit after the ground has gone dark.
   float twilight = smoothstep(-0.16, 0.005, sunUp) * (1.0 - smoothstep(0.005, 0.085, sunUp));
   vec3 hazeTint = mix(vec3(0.34, 0.55, 1.00), vec3(1.00, 0.36, 0.10), twilight * 0.8);
+
+  // The airlight closer to the camera is not the same colour as the airlight
+  // along the sun path: that is what makes a real limb warm on the sun side and
+  // cool on the far side instead of a uniform blue ring. Mix toward the low-sun
+  // colour as the view approaches the terminator.
+  float viewTwilight = smoothstep(-0.10, 0.14, sunUp) * (1.0 - smoothstep(0.14, 0.42, sunUp));
+  hazeTint = mix(hazeTint, vec3(0.86, 0.52, 0.34), viewTwilight * 0.35);
 
   float hazeAmount = haze * 0.62 * smoothstep(-0.09, 0.09, sunUp) * uAtmosphereIntensity;
   color = color * (1.0 - hazeAmount * 0.55) + hazeAmount * hazeTint * sunPath * 0.9;
