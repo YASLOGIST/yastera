@@ -29,6 +29,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import jpeg from 'jpeg-js';
 import { PNG } from 'pngjs';
+import { gradeLand } from './lib/landGrade.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const OUT_DIR = path.join(ROOT, 'public', 'textures');
@@ -358,26 +359,12 @@ async function buildAlbedo(trueColorImg, waterMask) {
       }
 
       sampleBilinear(trueColorImg, u, v, px);
-      let r = px[0];
-      let g = px[1];
-      let b = px[2];
-
-      // Gentle vegetal / arid micro-vibrance. Deliberately mild: the previous
-      // pass pushed +14% green which made forests radioactive under bloom.
-      const maxc = Math.max(r, g, b);
-      const minc = Math.min(r, g, b);
-      const sat = maxc > 0 ? (maxc - minc) / maxc : 0;
-      if (sat > 0.05) {
-        if (g >= r && g >= b) {
-          r *= 0.985;
-          g *= 1.045;
-          b *= 0.975;
-        } else if (r > g && r > b) {
-          r *= 1.005;
-          g *= 0.995;
-          b *= 0.975;
-        }
-      }
+      // Undo the composite's baked-in atmosphere and restore the reflectance
+      // spread that averaging flattened. See scripts/lib/landGrade.mjs.
+      const graded = gradeLand(px[0], px[1], px[2]);
+      let r = graded[0];
+      let g = graded[1];
+      let b = graded[2];
 
       // Blend the last kilometre of coastline toward the water base so the
       // anti-aliased mask edge never shows a bright sand/cyan seam.
@@ -548,10 +535,13 @@ async function buildClouds(cloudImg) {
   const smooth = boxBlur(median, TARGET_W, TARGET_H, 1, 1);
 
   const dst = Buffer.alloc(n * 4);
-  const GAMMA = 0.70;
-  const GAIN = 1.05;
+  // Store coverage linearly. An earlier pass applied a 0.70 gamma lift here to
+  // "make the clouds brighter", which also lifted half the clear sky off zero
+  // and turned the whole planet under a grey film; the shader cannot remove a
+  // veil it cannot distinguish from cloud. Contrast shaping belongs in
+  // `cloudDensity()` in lib/clouds.glsl, where it stays tunable.
   for (let i = 0; i < n; i += 1) {
-    const density = clamp01(Math.pow(clamp01(smooth[i]), GAMMA) * GAIN);
+    const density = clamp01(smooth[i]);
     const value = clamp255(density * 255);
     dst[i * 4] = value;
     dst[i * 4 + 1] = value;

@@ -3,15 +3,24 @@
 // ---------------------------------------------------------------------------
 // Cloud deck — fragment stage.
 //
-// A single shell lit like a participating medium rather than a white sprite:
+// A cloud top seen from orbit is one of the brightest surfaces in the scene:
+// a thick cumulus deck reflects ~85 % of the light that hits it. The failure
+// mode of cheap cloud shaders is the opposite — grey, translucent smoke —
+// because every term gets multiplied together and nothing ever reaches white.
+// The lighting below is therefore built from the physics of a thick scattering
+// slab, in this order:
 //
-//  • Normal from the density gradient (analytic tangent frame), so cumulus
-//    tops catch the sun and the bases fall into shadow.
-//  • Sun-direction tap marching = self-shadowing; thick cores go grey-blue,
-//    thin edges glow (powder / silver lining).
-//  • Forward Mie phase: clouds backlit by the sun flare along their rims.
-//  • Sunlight is transmitted through the atmosphere, so the deck reddens
-//    correctly along the terminator and stays dark on the night side.
+//  • Radiance comes from the slab's reflectance (1 - e^-tau), not from a
+//    wrapped N·L. A cloud top in full sun goes to white; only the terminator
+//    and genuine shadowing are allowed to darken it.
+//  • Shape comes from the density gradient: the normal is tilted across each
+//    cloud so its sunward flank lights up and its far flank rolls off. This is
+//    what makes a flat texture read as a field of towers.
+//  • Shadows come from a short march toward the sun. Only a *buried* pixel is
+//    dimmed — an isolated cumulus is the highest thing around, so it stays in
+//    full sun. Marching straight into every neighbour greys the whole deck.
+//  • The terminator reddens the deck through the same transmittance curve the
+//    surface uses, so ground and cloud agree about where dusk is.
 // ---------------------------------------------------------------------------
 
 uniform sampler2D uCloudsTexture;
@@ -40,142 +49,177 @@ in vec3 vLocalPos;
 
 out vec4 fragColor;
 
-const vec3 CLOUD_ALBEDO = vec3(0.96, 0.975, 1.0);
-const vec3 AMBIENT_SKY  = vec3(0.12, 0.21, 0.40);
+// Droplet reflectance: fresh cloud is very nearly white, a touch cool.
+const vec3 CLOUD_ALBEDO = vec3(1.0, 1.0, 1.0);
+// Skylight filling the shadowed flanks. Real cumulus shade is blue-grey, not
+// black, and never falls much below 60 % of the sunlit value.
+const vec3 AMBIENT_SKY  = vec3(0.42, 0.52, 0.72);
 
 void main() {
   #include <logdepthbuf_fragment>
   vec3 N = normalize(vNormalW);
   vec3 V = normalize(cameraPosition - vPosW);
   vec3 L = normalize(uSunDirection);
+  vec3 p = normalize(vLocalPos);
 
   float cosLat = max(cos((vUv.y - 0.5) * 3.14159265), 0.08);
   float zoom = 1.0 - smoothstep(1.010, 1.50, uCameraDistance);
+  float sunUp = dot(N, L);
+  float day = smoothstep(-0.055, 0.10, sunUp);
 
-  vec2 baseUv = vUv * uCloudScale + uCloudOffset;
-  vec2 cuv = cloudAdvect(baseUv, uCloudTime, uCloudDrift * uDriftScale);
-
-  float density = cloudDensity(uCloudsTexture, cuv);
+  float density;
+  float relief = uCloudRelief;
 
   if (uLayerMode > 0.5) {
-    // --- High cirrus deck -------------------------------------------------
-    // Cirrus is not a scaled copy of the tropospheric deck: it is fibrous ice
-    // crystal stretched by the jet stream. Generating it on the sphere keeps it
-    // seamless and free of the equirectangular stretch a second texture tap
-    // would inherit, and it layers visibly on top of the cumulus deck below.
-    vec3 p = normalize(vLocalPos);
-    vec3 streakDir = normalize(vec3(p.x, p.y * 4.2, p.z));
-    float drift = uTime * 0.0011;
-    float fibre = fbmSphere(streakDir + vec3(drift, 0.0, drift * 0.6), 11.0, 4.0);
-    float fibre2 = fbmSphere(streakDir * 2.1 - vec3(drift * 0.7, 0.0, 0.0), 26.0, 3.0);
-    float coverage = fbmSphere(p, 2.4, 2.0);
-    float mask = smoothstep(0.40, 0.74, coverage);
-    float shapes = smoothstep(0.46, 0.80, fibre * 0.72 + fibre2 * 0.28);
-    density = clamp(shapes * mask * 1.35, 0.0, 1.0);
-  }
+    // --- High cirrus deck ---------------------------------------------------
+    // Cirrus is not a separate weather system, it is the anvil of the systems
+    // already in the coverage map, seen from above: same shapes, advected
+    // faster (upper winds are stronger) and thresholded hard so only the tops
+    // of the deep systems reach this altitude.
+    //
+    // Generating it procedurally instead — as an earlier version did — cannot
+    // work: noise has no large-scale structure, so the deck came out as either
+    // uniform grey sheets or long parallel scratches. Reusing the map costs a
+    // single texture fetch and guarantees the deck is organised the same way
+    // the troposphere is, which is the whole visual point of a second layer.
+    vec2 cirrusUv = cloudAdvect(vUv * uCloudScale + uCloudOffset, uCloudTime, uCloudDrift * uDriftScale);
+    float raw = texture(uCloudsTexture, cirrusUv).r;
 
-  // --- Sub-texel filament detail -----------------------------------------
-  // Evaluated on the sphere direction, so the detail is seamless in longitude,
-  // free of polar pinching, and keeps adding structure all the way down to the
-  // 50 km inspection altitude.
-  // Detail must fade with the *screen* footprint of one texel. In an
-  // equirectangular map a texel spans 1/4096 of a revolution, i.e.
-  // fwidth(vUv.x) * cosLat in surface terms — dividing by cosLat would let the
-  // noise alias into streaks near the poles.
-  float detailFade = 1.0 - smoothstep(0.0004, 0.0045, fwidth(vUv.x) * cosLat);
-  if (detailFade > 0.01) {
-    vec3 p = normalize(vLocalPos);
-    vec3 w = vEastW * (uTime * 0.0016) + vNorthW * (uTime * 0.0009);
-    // Two scales: broad billows plus fine fibre. Both live on the sphere, so
-    // the deck gains believable structure without inheriting the texture's
-    // latitude stretch.
-    float macro = fbmSphere(normalize(p + w * 0.03), 34.0, 4.0) * 0.55
-                + fbmSphere(normalize(p + w * 0.02), 120.0, 2.0) * 0.45;
-    float micro = fbmSphere(normalize(p - w * 0.05), 260.0, 2.0);
-    float erosion = (macro - 0.5) * 0.44 + (micro - 0.5) * 0.18;
-    density = clamp(density + erosion * detailFade * (0.25 + 0.75 * (1.0 - density)), 0.0, 1.0);
+    // Fine structure, but at a frequency the map can actually resolve. An
+    // earlier 110x55 tap aliased into scratch marks across the whole disc,
+    // because at orbital scale one pixel already spans several cells of it.
+    float fibre = valueNoise(cirrusUv * vec2(26.0, 14.0) + vec2(uTime * 0.004, 0.0));
+    float body = smoothstep(0.46, 0.86, raw);
+    density = body * (0.55 + 0.45 * fibre);
+    relief = 0.0;
+  } else {
+    // --- Tropospheric deck from the coverage map ----------------------------
+    vec2 baseUv = vUv * uCloudScale + uCloudOffset;
+    vec2 cuv = cloudAdvect(baseUv, uCloudTime, uCloudDrift * uDriftScale);
+    density = cloudDensity(uCloudsTexture, cuv);
+
+    // --- Sub-texel filament detail -----------------------------------------
+    // Evaluated on the sphere direction, so it is seamless in longitude and
+    // free of polar pinching. Crucially it is weighted by how much cloud is
+    // already there: unweighted, the erosion term is a +-0.3 additive field and
+    // it paints noise over the half of the planet that has clear sky.
+    // Clear sky costs a single texture fetch: the erosion below is weighted by
+    // `presence`, so it can only ever modify a pixel that already has cloud,
+    // and skipping it cannot change the result.
+    float detailFade = 1.0 - smoothstep(0.0004, 0.0045, fwidth(vUv.x) * cosLat);
+    if (detailFade > 0.01 && density > 0.002) {
+      vec3 w = vEastW * (uTime * 0.0016) + vNorthW * (uTime * 0.0009);
+      float macro = fbmSphere(normalize(p + w * 0.03), 46.0, 3.0);
+      float micro = fbmSphere(normalize(p - w * 0.05), 190.0, 2.0);
+      // Multiplicative, not additive. Adding noise to coverage is what makes a
+      // deck look like TV static; modulating it keeps the map's large-scale
+      // structure while letting billows and filaments appear inside it.
+      float erosion = (macro - 0.5) * 0.34 + (micro - 0.5) * 0.12;
+      float presence = smoothstep(0.02, 0.30, density);
+      density = clamp(density * (1.0 + erosion * detailFade * presence * 1.6), 0.0, 1.0);
+    }
+
   }
 
   float alpha = density * uCloudOpacity * uLayerAlpha;
   if (alpha < 0.004) discard;
 
-  // --- Density gradient -> shading normal ---------------------------------
-  float tx = 1.5 / 4096.0;
-  float ty = 1.5 / 2048.0;
-  float dE = cloudDensity(uCloudsTexture, cuv + vec2(tx, 0.0));
-  float dW = cloudDensity(uCloudsTexture, cuv - vec2(tx, 0.0));
-  float dN = cloudDensity(uCloudsTexture, cuv + vec2(0.0, ty));
-  float dS = cloudDensity(uCloudsTexture, cuv - vec2(0.0, ty));
-  vec2 grad = vec2(dE - dW, dN - dS);
+  float sunVisibility = 1.0;
 
-  vec2 slope = grad * (0.55 + 0.45 * zoom) * uCloudRelief;
-  vec3 Np = normalize(N - (slope.x * vEastW + slope.y * vNorthW));
+  if (relief > 0.0) {
+    vec2 baseUv = vUv * uCloudScale + uCloudOffset;
+    vec2 cuv = cloudAdvect(baseUv, uCloudTime, uCloudDrift * uDriftScale);
 
-  vec3 T = normalize(vEastW);
-  vec3 Bn = normalize(vNorthW);
+    // --- Shape from coverage gradients --------------------------------------
+    // Five extra taps here would buy a marginally better normal, and cost every
+    // fragment on the deck — this shader runs on phones. The coverage map at
+    // 4096 px already resolves individual systems, so the screen-space
+    // derivative of `density` carries the slope for free: GLSL guarantees it is
+    // available in a non-uniform-control-flow branch, and it is already
+    // computed by the rasteriser.
+    vec2 grad = vec2(dFdx(density), dFdy(density));
+    // fwidth() is the same quantity scaled to the pixel, so dividing by it
+    // normalises the slope: a cliff and a gentle swell produce the same
+    // shading, and the result is stable at any zoom level. `relief` then sets
+    // how pronounced the shape should be.
+    float gradScale = relief / max(fwidth(density), 1e-4);
+    vec3 Np = normalize(N - grad.x * gradScale * vEastW - grad.y * gradScale * vNorthW);
 
-  // --- Self-shadowing: march a few texels toward the sun -------------------
-  vec2 sunUv = vec2(dot(L, T), dot(L, Bn));
-  float sunUvLen = length(sunUv);
-  sunUv = sunUvLen > 1e-4 ? sunUv / sunUvLen : vec2(1.0, 0.0);
-  float tau = 0.0;
-  float stepLen = 0.0018 + 0.0016 * zoom;
-  for (int i = 1; i <= 3; i += 1) {
-    tau += cloudDensity(uCloudsTexture, cuv + sunUv * (stepLen * float(i)));
+    float NdotL = dot(Np, L);
+    // Light wraps a little around the puffs; a harsh Lambert term makes a
+    // cloud field look like a cauliflower of black holes.
+    float wrapped = clamp((NdotL + 0.42) / 1.42, 0.0, 1.0);
+
+    // --- Burial shadow: is this pixel inside a dense field? -----------------
+    // Only dense cores march, which keeps clear sky and the thin veil free.
+    sunVisibility = 1.0;
+    if (density > 0.35) {
+      vec2 sunUv = vec2(dot(L, vEastW), dot(L, vNorthW));
+      float sunUvLen = length(sunUv);
+      sunUv = sunUvLen > 1e-4 ? sunUv / sunUvLen : vec2(1.0, 0.0);
+      float stepLen = 0.0016 + 0.0018 * zoom;
+      float pack = 0.0;
+      for (int i = 1; i <= 2; i += 1) {
+        pack += cloudDensity(uCloudsTexture, cuv + sunUv * (stepLen * float(i)));
+      }
+      float burial = smoothstep(0.95, 2.10, pack);
+      sunVisibility = mix(1.0, 0.62, burial);
+    }
+    // Thick cores read solid, thin edges read translucent and bright.
+    float thickness = clamp(density * 1.25, 0.0, 1.0);
+    float edgeGlow = pow(1.0 - thickness, 2.0);
+
+    vec3 sunTint = atmosphereTransmittanceFrom(0.0022, sunUp);
+    vec3 light = vec3(1.0, 0.985, 0.962) * uSunIntensity * sunTint;
+
+    // Forward Mie scattering: the silver lining when the sun is behind a tower.
+    float phase = hgPhase(dot(V, L), 0.62);
+
+    vec3 scattered = CLOUD_ALBEDO * light * (
+        wrapped * sunVisibility * 1.32
+      + AMBIENT_SKY * 0.30 * (1.0 - 0.35 * thickness)
+      + phase * 0.75 * edgeGlow
+    );
+
+    // Warm bounce from the sunlit air below the deck.
+    scattered += CLOUD_ALBEDO * light * vec3(1.0, 0.74, 0.54) * 0.05 * thickness;
+    fragColor = vec4(scattered, alpha);
+  } else {
+    // --- Cirrus ------------------------------------------------------------
+    // Thin ice cloud barely shadows itself and scatters strongly forward, so it
+    // is bright and almost unshaded, and simply fades out toward the limb.
+    vec3 sunTint = atmosphereTransmittanceFrom(0.0041, sunUp);
+    vec3 light = vec3(1.0, 0.985, 0.965) * uSunIntensity * sunTint;
+    float phase = hgPhase(dot(V, L), 0.55);
+    float edge = pow(1.0 - clamp(density, 0.0, 1.0), 1.6);
+    vec3 scattered = CLOUD_ALBEDO * light * (0.86 + phase * 1.1 * edge);
+    fragColor = vec4(scattered, alpha);
   }
-  float sunVisibility = 0.45 + 0.55 * exp(-tau * 1.15);
 
-  // --- Lighting ------------------------------------------------------------
-  float sunUp = dot(N, L);
-  float day = smoothstep(-0.055, 0.10, sunUp);
+  // --- Night side and aerial perspective (shared) ---------------------------
+  vec3 color = fragColor.rgb;
   float nightMask = 1.0 - smoothstep(-0.13, 0.015, sunUp);
+  // City underglow lighting the cloud bases from below: the pink-orange haze
+  // that makes ISS night passes recognisable.
+  vec3 nightGlow = vec3(1.0, 0.46, 0.16) * 0.035 * (1.0 - density * 0.5);
+  color = mix(nightGlow, color, day);
+  color *= mix(1.0, 0.70, nightMask);
 
-  vec3 sunTint = atmosphereTransmittanceFrom(0.0022, sunUp);
-  vec3 light = vec3(1.0, 0.978, 0.952) * uSunIntensity * sunTint;
-
-  float NdotL = dot(Np, L);
-  float wrapped = clamp((NdotL + 0.32) / 1.32, 0.0, 1.0);
-
-  // Multiple-scattering approximation: interiors stay grey-blue instead of
-  // collapsing to black, edges stay bright and translucent.
-  float opticalThickness = density * 2.6;
-  float interior = exp(-opticalThickness);
-  // Ambient occlusion between cloud masses stays shallow: real cumulus are
-  // almost as bright in shadow as in sun, they just lose specular punch.
-  float occlusion = 0.84 + 0.16 * interior;
-
-  // Forward Mie scattering (silver lining when the sun is behind the deck).
-  float mu = dot(V, L);
-  float phase = hgPhase(mu, 0.62);
-  float rim = pow(1.0 - clamp(density, 0.0, 1.0), 2.0);
-
-  vec3 scattered = CLOUD_ALBEDO * light * (
-      wrapped * sunVisibility * occlusion * 1.08
-    + AMBIENT_SKY * 0.20 * (1.0 - 0.5 * density)
-    + phase * 0.55 * rim
-  );
-
-  // Warm bounce from the sunlit atmosphere below the deck.
-  scattered += CLOUD_ALBEDO * light * vec3(1.0, 0.72, 0.52) * 0.05 * (1.0 - interior);
-
-  // --- Night side: city underglow, otherwise dark -------------------------
-  vec3 nightGlow = vec3(1.0, 0.52, 0.20) * 0.020 * (1.0 - density * 0.6);
-  scattered = mix(nightGlow, scattered, day);
-  scattered *= mix(1.0, 0.72, nightMask);
-
-  // --- Aerial perspective between the camera and the deck ----------------
   float cosV = clamp(dot(N, V), 1e-4, 1.0);
   vec3 viewT = atmosphereTransmittanceFrom(0.0022, cosV);
-  float airMass = relativeAirMass(cosV);
   vec3 hazeColor = vec3(0.30, 0.52, 0.92) * uSunIntensity * 0.30 * uAtmosphereIntensity;
-  vec3 finalColor = scattered * viewT + hazeColor * (vec3(1.0) - viewT) * smoothstep(-0.06, 0.2, sunUp);
+  color = color * viewT + hazeColor * (vec3(1.0) - viewT) * smoothstep(-0.06, 0.2, sunUp);
 
-  // --- Opacity ------------------------------------------------------------
-  // Thin cirrus stays translucent; dense cumulus goes opaque. At night the deck
-  // still occludes city light, so the alpha floor is higher than by day.
+  // At night the deck still occludes city light, so the alpha floor is higher
+  // than by day.
   float nightAlpha = mix(0.72, 1.0, day);
-  float zoomThin = mix(0.55, 1.0, smoothstep(1.015, 1.16, uCameraDistance));
-  alpha = clamp(pow(alpha, 0.82) * 1.02, 0.0, 1.0) * nightAlpha * zoomThin;
+  float zoomThin = mix(0.62, 1.0, smoothstep(1.015, 1.16, uCameraDistance));
+  // A cell that is 70 % covered is 70 % covered on average, but the cloud in it
+  // is solid: the remaining 30 % is open sky *beside* the cloud, not darkness
+  // *through* it. So the top of the range is pushed to fully opaque while the
+  // thin tail is left alone. A power curve over the whole range would do the
+  // first and ruin the second, which is how the deck ended up as grey film.
+  alpha = clamp(alpha + smoothstep(0.45, 0.95, alpha) * 0.45, 0.0, 1.0) * nightAlpha * zoomThin;
 
-  fragColor = vec4(finalColor, alpha);
+  fragColor = vec4(color, alpha);
 }

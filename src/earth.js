@@ -150,11 +150,16 @@ export function createEarth(textures) {
   const highDeck = makeCloudLayer({
     radius: CLOUD_HIGH_RADIUS,
     segments: 160,
-    scale: [1.73, 1.21],
-    offset: [0.37, 0.11],
-    alpha: 0.62,
+    // The map tiles in longitude but is clamped in latitude, so scaling v
+    // above 1 clamps to the north pole and paints a flat band across the top of
+    // the globe. Keep the scale at 1 and decorrelate with an offset instead —
+    // the deck then shows the same systems at a different phase, which is what
+    // high cloud actually looks like from above.
+    scale: [1.0, 1.0],
+    offset: [0.47, 0.0],
+    alpha: 0.26,
     driftScale: 1.9,
-    relief: 0.55,
+    relief: 0.0,
     order: 2,
     mode: 1,
   });

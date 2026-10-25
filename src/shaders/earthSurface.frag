@@ -83,8 +83,9 @@ void main() {
   float land = 1.0 - water;
 
   // --- Height field --------------------------------------------------------
+  // Height-field convention (see scripts/fetch-assets.mjs): 15 = abyssal
+  // plain, 85 = shelf break at the coastline, 250 = highest peaks.
   float hGrey = texture(uTopologyMap, uv).r * 255.0;
-  float depth01 = clamp((85.0 - hGrey) / 70.0, 0.0, 1.0);
 
   // --- Terrain relief (land only) -----------------------------------------
   vec2 texel = uTopologyTexel;
@@ -121,10 +122,14 @@ void main() {
 
   float sunHeight = max(sunUp, 0.20);
   vec2 uvSun = vec2(dot(L, T) / (PI2 * cosLat), dot(L, B) / PI);
+  // Two taps at different distances give a penumbra rather than a hard stencil:
+  // near the terminator the shadow lengthens and softens, exactly as a low sun
+  // stretches a cloud's shadow across the water.
   vec2 shadowShift = uvSun * (uCloudHeight / sunHeight) * 0.85;
-  float shadowA = cloudDensity(uCloudsTexture, cloudUv + shadowShift) * uCloudOpacity;
-  float shadowB = cloudDensity(uCloudsTexture, cloudUv + shadowShift * 2.1) * uCloudOpacity;
-  float shadowFactor = 1.0 - (shadowA * 0.72 + shadowB * 0.28) * 0.82 * day;
+  float shadowA = cloudShadowDepth(uCloudsTexture, cloudUv + shadowShift) * uCloudOpacity;
+  float shadowB = cloudShadowDepth(uCloudsTexture, cloudUv + shadowShift * 2.1) * uCloudOpacity;
+  float shadowTau = (shadowA * 0.72 + shadowB * 0.28) * 2.4;
+  float shadowFactor = 1.0 - (1.0 - exp(-shadowTau)) * 0.86 * day;
 
   // --- Land albedo + zoom-adaptive micro detail ---------------------------
   vec3 landAlbedo = texture(uDayTexture, uv).rgb;
@@ -182,16 +187,21 @@ void main() {
   }
 
   // --- Ocean albedo: depth-stratified water body --------------------------
-  // Beer-Lambert-ish absorption: turquoise only over true shoals, deep navy in
-  // the abyss. Kept deliberately unsaturated so the sun glitter and the blue
-  // aerial haze own the final colour instead of a painted cyan shelf.
-  vec3 shoalWater = vec3(0.030, 0.098, 0.118);
-  vec3 shelfWater = vec3(0.014, 0.050, 0.092);
-  vec3 deepWater  = vec3(0.0065, 0.0225, 0.0520);
-  // Only the outer shelf (a few hundred metres) shifts hue; the abyssal plains
-  // that make up 95% of the ocean stay a uniform deep blue.
-  vec3 waterAlbedo = mix(shoalWater, shelfWater, smoothstep(0.55, 0.90, depth01));
-  waterAlbedo = mix(waterAlbedo, deepWater, smoothstep(0.32, 0.80, depth01));
+  // Seawater is opaque to visible light within tens of metres, so from orbit
+  // the open ocean is one uniform deep blue and carries no bathymetry at all —
+  // the mid-ocean ridges, trenches and seamounts that dominate a bathymetric
+  // map are simply not visible. Only the continental shelves, where the bottom
+  // is within a few tens of metres of the surface, show any colour shift.
+  //
+  // An earlier version ramped hue across the whole depth range, which painted
+  // a turquoise band along every mid-ocean ridge and made the Atlantic look
+  // like a lagoon. The ramp below is therefore keyed to the *shelf* only:
+  // the height field runs 15 = abyss to 85 = shelf break, so anything below
+  // about 62 stays the same deep navy no matter how the map shades it.
+  vec3 deepWater  = vec3(0.0080, 0.0230, 0.0520);
+  vec3 shelfWater = vec3(0.0180, 0.0620, 0.0800);
+  float shelf = smoothstep(62.0, 85.0, hGrey);
+  vec3 waterAlbedo = mix(deepWater, shelfWater, shelf);
 
   // Wet sand: the last kilometre of coast is darker and less reflective.
   float wetBand = smoothstep(0.0, 0.30, water) * (1.0 - smoothstep(0.30, 0.72, water));
@@ -257,11 +267,19 @@ void main() {
   color += cityVisible * uNightIntensity * nightMask;
 
   // --- Rayleigh aerial perspective ---------------------------------------
-  // A full transmittance integral over the vertical column is far too strong
-  // for a camera 2 R away: it turns the whole disc milky. The visible effect
-  // is the *excess* air mass above zenith, which grows toward the limb.
+  // The atmosphere adds its own radiance on top of the surface, and that
+  // addition is never zero: even looking straight down, roughly a sixth of the
+  // light that leaves the ground is scattered air rather than ground. Modelling
+  // only the *extra* air mass toward the limb (the obvious reading of
+  // `airmass - 1`) therefore leaves the ocean at the disc centre at true
+  // surface colour, which is nearly black — and no photograph of Earth from
+  // space has ever looked like that.
+  //
+  // So the term is the full path in-scattering. The coefficient folds in
+  // aerosol and multiple scattering, which is why it is larger than a naive
+  // single-scatter optical depth would be.
   float airMass = relativeAirMass(cosV);
-  float haze = 1.0 - exp(-max(airMass - 1.0, 0.0) * 0.085);
+  float haze = 1.0 - exp(-airMass * 0.16);
   vec3 sunPath = atmosphereTransmittanceFrom(0.0, sunUp);
 
   // Twilight: the air column is still sunlit after the ground has gone dark.
