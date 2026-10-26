@@ -12,8 +12,8 @@ const shellVert = SHADERS.shellVertex;
 const haloFrag = SHADERS.atmosphereHalo;
 
 export const EARTH_RADIUS = 1.0;
-export const CLOUD_RADIUS = 1.0022;        // ~14 km: main tropospheric deck
-export const CLOUD_HIGH_RADIUS = 1.0041;   // ~26 km: thin upper deck / cirrus
+export const CLOUD_RADIUS = 1.0020;         // ~13 km: main tropospheric deck
+export const CLOUD_HIGH_RADIUS = 1.0027;    // ~17 km: high anvils / cirrus
 export const ATMOSPHERE_RADIUS = 1.028;    // ~178 km: scattering shell
 export const AXIAL_TILT_DEG = 23.44;
 
@@ -27,17 +27,17 @@ export const AXIAL_TILT_DEG = 23.44;
  */
 
 /**
- * Builds the four-layer Earth: PBR ocean/land surface, two cloud decks and the
- * scattering atmosphere shell.
+ * Builds the layered Earth: PBR ocean/land surface, a shaped cloud deck, a
+ * high-cloud veil and the scattering atmosphere shell.
  *
  * Hierarchy:
  *   group (axial tilt about Z)
  *   └─ spin (rotation about the tilted polar axis)
- *      ├─ surface    r = 1.000
- *      ├─ clouds     r = 1.0022  (UV-advected, differential zonal winds)
- *      ├─ cirrus     r = 1.0041
- *      └─ beacons    attached by the caller
- *   └─ halo         r = 1.028  (BackSide additive ray marched)
+ *      ├─ surface       r = 1.0000
+ *      ├─ cloud tops    r = 1.0020  (UV-advected, differential zonal winds)
+ *      ├─ cirrus        r = 1.0027  (dense cores / upper-level veil)
+ *      └─ beacons       attached by the caller
+ *   └─ halo             r = 1.0280  (BackSide additive ray marched)
  *
  * @param {EarthTextures} textures
  */
@@ -52,7 +52,7 @@ export function createEarth(textures) {
     uCloudOpacity: { value: 1.0 },
     uCameraDistance: { value: 3.1 },
     uCloudTime: { value: 0 },
-    uCloudDrift: { value: 0.055 },
+    uCloudDrift: { value: 0.004 },
     uTime: { value: 0 },
   };
 
@@ -114,6 +114,8 @@ export function createEarth(textures) {
       uCloudOffset: { value: new THREE.Vector2(offset[0], offset[1]) },
       uLayerAlpha: { value: alpha },
       uLayerMode: { value: mode },
+      uCloudDetail: { value: 1.0 },
+      uLightningIntensity: { value: 0.65 },
       uDriftScale: { value: driftScale },
       uCloudRelief: { value: relief },
     };
@@ -130,7 +132,7 @@ export function createEarth(textures) {
     });
 
     const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, segments, segments), material);
-    mesh.name = order === 1 ? 'earthClouds' : 'earthCirrus';
+    mesh.name = mode > 0.5 ? 'earthCirrus' : 'earthClouds';
     mesh.renderOrder = order;
     return { mesh, material, uniforms };
   };
@@ -150,15 +152,14 @@ export function createEarth(textures) {
   const highDeck = makeCloudLayer({
     radius: CLOUD_HIGH_RADIUS,
     segments: 160,
-    // The map tiles in longitude but is clamped in latitude, so scaling v
-    // above 1 clamps to the north pole and paints a flat band across the top of
-    // the globe. Keep the scale at 1 and decorrelate with an offset instead —
-    // the deck then shows the same systems at a different phase, which is what
-    // high cloud actually looks like from above.
+    // Keep the upper veil registered to the observed cloud systems below it.
+    // It is derived from their denser cores, then advected slightly faster to
+    // suggest upper-level winds; a longitude offset would invent unrelated
+    // weather on the opposite side of the globe.
     scale: [1.0, 1.0],
-    offset: [0.47, 0.0],
-    alpha: 0.26,
-    driftScale: 1.9,
+    offset: [0.0, 0.0],
+    alpha: 0.36,
+    driftScale: 1.3,
     relief: 0.0,
     order: 2,
     mode: 1,
@@ -204,6 +205,11 @@ export function createEarth(textures) {
       cirrus: highDeck.material.uniforms,
       halo: haloMaterial.uniforms,
     },
-    materials: { surface: surfaceMaterial, clouds: lowDeck.material, cirrus: highDeck.material, halo: haloMaterial },
+    materials: {
+      surface: surfaceMaterial,
+      clouds: lowDeck.material,
+      cirrus: highDeck.material,
+      halo: haloMaterial,
+    },
   };
 }

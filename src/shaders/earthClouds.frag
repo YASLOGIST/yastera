@@ -37,7 +37,9 @@ uniform float uTime;
 uniform vec2  uCloudScale;
 uniform vec2  uCloudOffset;
 uniform float uLayerAlpha;
-uniform float uLayerMode;   // 0 = low/mid deck from texture, 1 = high cirrus (procedural)
+uniform float uLayerMode;   // 0 = shaped cloud deck, 1 = high ice veil
+uniform float uCloudDetail;
+uniform float uLightningIntensity;
 
 in vec2 vUv;
 in vec3 vPosW;
@@ -53,7 +55,15 @@ out vec4 fragColor;
 const vec3 CLOUD_ALBEDO = vec3(1.0, 1.0, 1.0);
 // Skylight filling the shadowed flanks. Real cumulus shade is blue-grey, not
 // black, and never falls much below 60 % of the sunlit value.
-const vec3 AMBIENT_SKY  = vec3(0.42, 0.52, 0.72);
+const vec3 AMBIENT_SKY  = vec3(0.48, 0.58, 0.76);
+
+// Geographic east in the globe's local frame. Keeping procedural detail in
+// this frame prevents it from sliding as the entire Earth rotates in world space.
+vec3 eastTangent(vec3 dir) {
+  vec3 east = cross(vec3(0.0, 1.0, 0.0), dir);
+  float len = length(east);
+  return len > 1e-5 ? east / len : normalize(cross(vec3(1.0, 0.0, 0.0), dir));
+}
 
 void main() {
   #include <logdepthbuf_fragment>
@@ -62,10 +72,10 @@ void main() {
   vec3 L = normalize(uSunDirection);
   vec3 p = normalize(vLocalPos);
 
-  float cosLat = max(cos((vUv.y - 0.5) * 3.14159265), 0.08);
   float zoom = 1.0 - smoothstep(1.010, 1.50, uCameraDistance);
   float sunUp = dot(N, L);
   float day = smoothstep(-0.055, 0.10, sunUp);
+  float altitude = max(length(vPosW - vCenterW) - 1.0, 0.0);
 
   float density;
   float relief = uCloudRelief;
@@ -74,53 +84,74 @@ void main() {
   vec2 troposphereUv = vec2(0.0);
 
   if (uLayerMode > 0.5) {
-    // --- High cirrus deck ---------------------------------------------------
-    // Cirrus is not a separate weather system, it is the anvil of the systems
-    // already in the coverage map, seen from above: same shapes, advected
-    // faster (upper winds are stronger) and thresholded hard so only the tops
-    // of the deep systems reach this altitude.
-    //
-    // Generating it procedurally instead — as an earlier version did — cannot
-    // work: noise has no large-scale structure, so the deck came out as either
-    // uniform grey sheets or long parallel scratches. Reusing the map costs a
-    // single texture fetch and guarantees the deck is organised the same way
-    // the troposphere is, which is the whole visual point of a second layer.
+    // --- Upper ice veil -----------------------------------------------------
+    // The upper layer is constrained to denser systems in the same coverage
+    // map as the main deck. A different longitude phase invents unrelated
+    // weather and makes the two layers visibly slide across one another.
     vec2 cirrusUv = cloudAdvect(vUv * uCloudScale + uCloudOffset, uCloudTime, uCloudDrift * uDriftScale);
-    float raw = texture(uCloudsTexture, cirrusUv).r;
+    float raw = cloudDensity(uCloudsTexture, cirrusUv);
 
-    // Fine structure, but at a frequency the map can actually resolve. An
-    // earlier 110x55 tap aliased into scratch marks across the whole disc,
-    // because at orbital scale one pixel already spans several cells of it.
-    float fibre = valueNoise(cirrusUv * vec2(26.0, 14.0) + vec2(uTime * 0.004, 0.0));
-    float body = smoothstep(0.46, 0.86, raw);
-    density = body * (0.55 + 0.45 * fibre);
+    // Dense convective cores seed the high veil; a weaker shoulder represents
+    // thin outflow around anvils instead of a second, opaque copy of the deck.
+    float core = smoothstep(0.48, 0.86, raw);
+    float anvil = smoothstep(0.30, 0.62, raw) * (1.0 - core * 0.42);
+    density = clamp(core * 0.62 + anvil * 0.30, 0.0, 1.0);
+
+    // Spherical ice filaments are high-frequency and only appear when their
+    // footprint is resolved. At orbital scale the weather map carries the form.
+    float fibreFootprint = length(fwidth(p)) * 240.0;
+    float detailAmount = clamp(uCloudDetail, 0.0, 1.5);
+    float fibreFade = (1.0 - smoothstep(0.55, 1.15, fibreFootprint)) * zoom * detailAmount;
+    if (fibreFade > 0.01 && density > 0.002) {
+      vec3 eastLocal = eastTangent(p);
+      vec3 northLocal = normalize(cross(p, eastLocal));
+      vec3 windOffset = eastLocal * (uTime * 0.0006) + northLocal * (uTime * 0.0002);
+      float structure = fbmSphere(normalize(p + windOffset * 0.025), 240.0, 3.0);
+      density *= mix(1.0, 0.72 + 0.56 * structure, fibreFade);
+    }
     relief = 0.0;
   } else {
-    // --- Tropospheric deck from the coverage map ----------------------------
+    // --- Tropospheric cloud tops from the coverage map ----------------------
     vec2 baseUv = vUv * uCloudScale + uCloudOffset;
     vec2 cuv = cloudAdvect(baseUv, uCloudTime, uCloudDrift * uDriftScale);
     troposphereUv = cuv;
     density = cloudDensity(uCloudsTexture, cuv);
 
-    // --- Sub-texel filament detail -----------------------------------------
-    // Evaluated on the sphere direction, so it is seamless in longitude and
-    // free of polar pinching. Crucially it is weighted by how much cloud is
-    // already there: unweighted, the erosion term is a +-0.3 additive field and
-    // it paints noise over the half of the planet that has clear sky.
-    // Clear sky costs a single texture fetch: the erosion below is weighted by
-    // `presence`, so it can only ever modify a pixel that already has cloud,
-    // and skipping it cannot change the result.
-    float detailFade = 1.0 - smoothstep(0.0004, 0.0045, fwidth(vUv.x) * cosLat);
-    if (detailFade > 0.01 && density > 0.002) {
-      vec3 w = vEastW * (uTime * 0.0016) + vNorthW * (uTime * 0.0009);
-      float macro = fbmSphere(normalize(p + w * 0.03), 46.0, 3.0);
-      float micro = fbmSphere(normalize(p - w * 0.05), 190.0, 2.0);
-      // Multiplicative, not additive. Adding noise to coverage is what makes a
-      // deck look like TV static; modulating it keeps the map's large-scale
-      // structure while letting billows and filaments appear inside it.
-      float erosion = (macro - 0.5) * 0.34 + (micro - 0.5) * 0.12;
-      float presence = smoothstep(0.02, 0.30, density);
-      density = clamp(density * (1.0 + erosion * detailFade * presence * 1.6), 0.0, 1.0);
+    // --- Screen-space cloud structure --------------------------------------
+    // fBm lives on the unit sphere, not the UV map, so it has no longitude seam
+    // or polar pinch. Its frequencies are independently filtered by pixel
+    // footprint to avoid shimmer as the camera moves through the orbital view.
+    float pixelFootprint = length(fwidth(p));
+    float macroFootprint = pixelFootprint * 120.0;
+    float microFootprint = pixelFootprint * 360.0;
+    float detailScale = clamp(uCloudDetail, 0.0, 1.5);
+    float macroFade = (1.0 - smoothstep(0.55, 1.20, macroFootprint)) * detailScale;
+    float microFade = (1.0 - smoothstep(0.55, 1.20, microFootprint)) * detailScale;
+
+    // The weather map stores fractional cover. Keep that average in orbit, but
+    // resolve it into opaque cloud puffs and clear gaps on descent, where a
+    // translucent grey sheet would look like smoke instead of a cloud body.
+    if ((macroFade > 0.01 || microFade > 0.01) && density > 0.002) {
+      vec3 eastLocal = eastTangent(p);
+      vec3 northLocal = normalize(cross(p, eastLocal));
+      vec3 w = eastLocal * (uTime * 0.0016) + northLocal * (uTime * 0.0009);
+      float macro = fbmSphere(normalize(p + w * 0.03), 120.0, 3.0);
+      float micro = fbmSphere(normalize(p - w * 0.05), 360.0, 2.0);
+
+      float meanCoverage = density;
+      float presence = smoothstep(0.02, 0.25, meanCoverage);
+      float erosion = (macro - 0.5) * 0.30 * macroFade
+                    + (micro - 0.5) * 0.11 * microFade;
+      float detailedCoverage = clamp(meanCoverage * (1.0 + erosion * presence * 1.35), 0.0, 1.0);
+
+      // Approximate a coverage-preserving realization of fractional cells. The
+      // mapping is disabled in orbit and fades in smoothly as individual cloud
+      // forms become resolvable from the camera.
+      float cloudNoise = smoothstep(0.28, 0.72, mix(macro, micro, 0.32));
+      float threshold = 1.0 - meanCoverage;
+      float resolvedCoverage = smoothstep(threshold - 0.12, threshold + 0.12, cloudNoise);
+      float resolveAmount = clamp(zoom * 0.62 * smoothstep(0.02, 0.15, meanCoverage) * detailScale, 0.0, 1.0);
+      density = mix(detailedCoverage, resolvedCoverage, resolveAmount);
     }
 
   }
@@ -186,22 +217,30 @@ void main() {
     sunVisibility = 1.0;
     if (density > 0.35) {
       vec2 cuv = troposphereUv;
-      vec2 sunUv = vec2(dot(L, vEastW), dot(L, vNorthW));
-      float sunUvLen = length(sunUv);
-      sunUv = sunUvLen > 1e-4 ? sunUv / sunUvLen : vec2(1.0, 0.0);
-      float stepLen = 0.0016 + 0.0018 * zoom;
+      float latitude = (vUv.y - 0.5) * PI;
+      float cosLatitude = max(cos(latitude), 0.06);
+      vec2 sunTangent = vec2(dot(L, vEastW), dot(L, vNorthW));
+      float sunTangentLength = max(length(sunTangent), 1e-4);
+      // Convert a physical angular march into equirectangular UV units. One
+      // unit of longitude is 2π cos(latitude) times wider than one unit of
+      // latitude; treating both UV axes equally skews shadowing by up to 2×.
+      vec2 sunUvPerRadian = vec2(
+        sunTangent.x / (sunTangentLength * PI2 * cosLatitude),
+        sunTangent.y / (sunTangentLength * PI)
+      );
+      float stepAngle = 0.0013 + 0.0015 * zoom;
       float pack = 0.0;
-      for (int i = 1; i <= 2; i += 1) {
-        pack += cloudDensity(uCloudsTexture, cuv + sunUv * (stepLen * float(i)));
+      for (int i = 1; i <= 3; i += 1) {
+        pack += cloudDensity(uCloudsTexture, cuv + sunUvPerRadian * (stepAngle * float(i)));
       }
-      float burial = smoothstep(0.95, 2.10, pack);
-      sunVisibility = mix(1.0, 0.62, burial);
+      float burial = smoothstep(1.15, 2.45, pack);
+      sunVisibility = mix(1.0, 0.56, burial);
     }
     // Thick cores read solid, thin edges read translucent and bright.
     float thickness = clamp(density * 1.25, 0.0, 1.0);
     float edgeGlow = pow(1.0 - thickness, 2.0);
 
-    vec3 sunTint = atmosphereTransmittanceFrom(0.0022, sunUp);
+    vec3 sunTint = atmosphereTransmittanceFrom(altitude, sunUp);
     vec3 light = vec3(1.0, 0.985, 0.962) * uSunIntensity * sunTint;
 
     // Forward Mie scattering: the silver lining when the sun is behind a tower.
@@ -213,7 +252,9 @@ void main() {
 
     vec3 scattered = CLOUD_ALBEDO * light * (
         wrapped * sunVisibility * 1.32
-      + AMBIENT_SKY * 0.30 * (1.0 - 0.35 * thickness)
+      // Multiple scattering brightens thick interiors instead of turning them
+      // into flat grey discs; blue skylight still colours the shadowed flanks.
+      + AMBIENT_SKY * (0.30 + 0.22 * thickness)
       + phase * 0.75 * edgeGlow
     );
 
@@ -224,7 +265,7 @@ void main() {
     // --- Cirrus ------------------------------------------------------------
     // Thin ice cloud barely shadows itself and scatters strongly forward, so it
     // is bright and almost unshaded, and simply fades out toward the limb.
-    vec3 sunTint = atmosphereTransmittanceFrom(0.0041, sunUp);
+    vec3 sunTint = atmosphereTransmittanceFrom(altitude, sunUp);
     vec3 light = vec3(1.0, 0.985, 0.965) * uSunIntensity * sunTint;
     float phase = hgPhase(-dot(V, L), 0.55);
     float edge = pow(1.0 - clamp(density, 0.0, 1.0), 1.6);
@@ -241,8 +282,32 @@ void main() {
   color = mix(nightGlow, color, day);
   color *= mix(1.0, 0.70, nightMask);
 
+  // Rare, localized intra-cloud flashes: deterministic per advected weather
+  // cell, gated to dense storm cores and the night side. The soft spatial falloff
+  // avoids square cell edges; this is a diffuse cloud flash, not a fake surface bolt.
+  if (uLayerMode < 0.5 && uLightningIntensity > 0.001 && nightMask > 0.01 && density > 0.60) {
+    vec2 stormUv = vec2(fract(troposphereUv.x), clamp(troposphereUv.y, 0.001, 0.999));
+    vec2 stormGrid = vec2(256.0, 128.0);
+    vec2 cell = floor(stormUv * stormGrid);
+    vec2 local = fract(stormUv * stormGrid);
+    float seed = hash12(cell + vec2(23.7, 61.9));
+    float offset = hash12(cell + vec2(11.3, 47.1));
+    float eventClock = uTime * 0.2 + offset;
+    float eventCycle = floor(eventClock);
+    float eventPhase = fract(eventClock);
+    float eventChance = hash12(cell + vec2(eventCycle * 17.1 + 3.7, eventCycle * 29.7 + 11.3));
+    float event = step(0.98, eventChance);
+    float pulse = exp(-eventPhase * 80.0)
+                + 0.45 * exp(-abs(eventPhase - 0.035) * 100.0);
+    vec2 flashCenter = vec2(seed, hash12(cell + vec2(71.3, 19.7)));
+    float flashArea = 1.0 - smoothstep(0.18, 0.48, length(local - flashCenter));
+    float stormCore = smoothstep(0.62, 0.88, density);
+    float flash = event * pulse * flashArea * stormCore * uLightningIntensity;
+    color += vec3(0.54, 0.72, 1.0) * flash * 0.72;
+  }
+
   float cosV = clamp(dot(N, V), 1e-4, 1.0);
-  vec3 viewT = atmosphereTransmittanceFrom(0.0022, cosV);
+  vec3 viewT = atmosphereTransmittanceFrom(altitude, cosV);
   vec3 hazeColor = vec3(0.30, 0.52, 0.92) * uSunIntensity * 0.30 * uAtmosphereIntensity;
   color = color * viewT + hazeColor * (vec3(1.0) - viewT) * smoothstep(-0.06, 0.2, sunUp);
 

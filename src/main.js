@@ -6,7 +6,6 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { FXAAShader } from 'three/examples/jsm/shaders/FXAAShader.js';
-import GUI from 'lil-gui';
 
 import { createEarth } from './earth.js';
 import { createBeacons } from './beacons.js';
@@ -14,6 +13,20 @@ import { createStarfield } from './starfield.js';
 import { solarPosition } from './solar.js';
 import { latLngToVector3, formatLatLng } from './geo.js';
 import { CITIES, getCityLocalTime } from './cities.js';
+import {
+  createLEOTracker,
+  isSatelliteEclipsed,
+  LEO_ALTITUDE_KM,
+  LEO_INCLINATION_DEG,
+  LEO_ORBITAL_PERIOD_MINUTES,
+  LEO_ORBITAL_SPEED_KM_S,
+} from './leoTracker.js';
+import {
+  canUseFloatMsaa,
+  CONSTRAINED_RENDER_PIXEL_BUDGET,
+  DESKTOP_RENDER_PIXEL_BUDGET,
+  getMaxPixelRatio,
+} from './renderBudget.js';
 
 // ---------------------------------------------------------------------------
 // Fatal error overlay & diagnostics
@@ -98,7 +111,23 @@ const renderer = new THREE.WebGLRenderer({
   logarithmicDepthBuffer: true,
   stencil: false,
 });
-const MAX_PIXEL_RATIO = Math.min(window.devicePixelRatio || 1, 2);
+const profileMode = new URLSearchParams(window.location.search).get('profile') === '1';
+document.documentElement.classList.toggle('profile-mode', profileMode);
+renderer.info.autoReset = !profileMode;
+const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+const deviceMemoryGiB = Number(navigator.deviceMemory) || 0;
+const constrainedDevice = coarsePointer || (deviceMemoryGiB > 0 && deviceMemoryGiB <= 4);
+const renderPixelBudget = constrainedDevice
+  ? CONSTRAINED_RENDER_PIXEL_BUDGET
+  : DESKTOP_RENDER_PIXEL_BUDGET;
+const maxPixelRatioForViewport = (width, height) =>
+  getMaxPixelRatio({
+    width,
+    height,
+    devicePixelRatio: window.devicePixelRatio || 1,
+    pixelBudget: renderPixelBudget,
+  });
+let MAX_PIXEL_RATIO = maxPixelRatioForViewport(window.innerWidth, window.innerHeight);
 // Minimum time between adaptive-resolution steps. Long enough that a step gets
 // several measurement windows to prove itself before the controller reacts.
 const ADAPT_DWELL_MS = 4000;
@@ -124,8 +153,8 @@ function writeText(el, value) {
  * the page is open, and the scene is a full-screen continuous animation where
  * respecting it is the difference between usable and nauseating.
  */
-const prefersReducedMotion =
-  window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+const motionPreferenceQuery = window.matchMedia?.('(prefers-reduced-motion: reduce)');
+const prefersReducedMotion = motionPreferenceQuery?.matches ?? false;
 let pixelRatio = MAX_PIXEL_RATIO;
 renderer.setPixelRatio(pixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
@@ -174,26 +203,37 @@ controls.maxDistance = 7.0;
 controls.zoomToCursor = false;
 
 // ---------------------------------------------------------------------------
-// Post-Processing: HDR + 4x MSAA + calibrated bloom
+// Post-Processing: HDR + budgeted MSAA/FXAA + calibrated bloom
 // ---------------------------------------------------------------------------
-// HDR targets are renderable only with the float colour-buffer extension, and
-// multisampled half-float targets are not guaranteed on every mobile GPU. Probe
-// once, then fall back to a post-process anti-aliaser instead of MSAA.
+// Multisampled HDR targets multiply color/depth storage by the sample count.
+// Keep 4x MSAA for small desktop buffers only; coarse-pointer, low-memory,
+// high-DPR and large-canvas cases use FXAA instead.
 const gl = renderer.getContext();
 const msaaDisabledByQuery = new URLSearchParams(window.location.search).get('msaa') === '0';
-const canFloatMSAA =
-  !msaaDisabledByQuery &&
-  renderer.extensions.has('EXT_color_buffer_float') &&
-  (gl.getParameter(gl.MAX_SAMPLES) || 0) >= 4;
+let canFloatMSAA = canUseFloatMsaa({
+  width: window.innerWidth,
+  height: window.innerHeight,
+  pixelRatio,
+  maxSamples: gl.getParameter(gl.MAX_SAMPLES) || 0,
+  floatColorBuffer: renderer.extensions.has('EXT_color_buffer_float'),
+  coarsePointer,
+  deviceMemoryGiB,
+  disabled: msaaDisabledByQuery,
+});
 
 const makeRenderTarget = () =>
   new THREE.WebGLRenderTarget(
-    Math.floor(window.innerWidth * pixelRatio),
-    Math.floor(window.innerHeight * pixelRatio),
+    Math.floor(window.innerWidth),
+    Math.floor(window.innerHeight),
     { type: THREE.HalfFloatType, samples: canFloatMSAA ? 4 : 0 },
   );
 
 const composer = new EffectComposer(renderer, makeRenderTarget());
+// EffectComposer treats the supplied target's dimensions as logical pixels and
+// applies the renderer's DPR itself. Size it explicitly before adding passes so
+// the initial frame uses the same physical resolution (and bloom buffers) as a
+// later resize instead of multiplying a pre-scaled target by DPR twice.
+composer.setSize(window.innerWidth, window.innerHeight);
 composer.addPass(new RenderPass(scene, camera));
 
 const bloomPass = new UnrealBloomPass(
@@ -205,15 +245,75 @@ const bloomPass = new UnrealBloomPass(
 composer.addPass(bloomPass);
 composer.addPass(new OutputPass());
 
-// Anti-alias the LDR result only when the MSAA path is unavailable.
-let fxaaPass = null;
-if (!canFloatMSAA) {
-  fxaaPass = new ShaderPass(FXAAShader);
-  fxaaPass.material.uniforms.resolution.value.set(
-    1 / (window.innerWidth * pixelRatio),
-    1 / (window.innerHeight * pixelRatio),
-  );
-  composer.addPass(fxaaPass);
+// The FXAA pass stays available for a resize that crosses the MSAA pixel
+// budget; it is disabled while the small-buffer MSAA path is active.
+const fxaaPass = new ShaderPass(FXAAShader);
+fxaaPass.enabled = !canFloatMSAA;
+fxaaPass.material.uniforms.resolution.value.set(
+  1 / (window.innerWidth * pixelRatio),
+  1 / (window.innerHeight * pixelRatio),
+);
+composer.addPass(fxaaPass);
+
+function setMultisampling(enabled) {
+  if (enabled === canFloatMSAA) return;
+  canFloatMSAA = enabled;
+  const samples = enabled ? 4 : 0;
+  composer.renderTarget1.samples = samples;
+  composer.renderTarget2.samples = samples;
+  // Invalidate renderer-owned framebuffers so the new sample count is applied
+  // on the next frame, then keep exactly one anti-aliasing path active.
+  composer.renderTarget1.dispose();
+  composer.renderTarget2.dispose();
+  fxaaPass.enabled = !enabled;
+}
+
+function estimateTextureGpuBytes(texture) {
+  const image = texture?.image;
+  let width = image?.naturalWidth || image?.videoWidth || image?.width || 0;
+  let height = image?.naturalHeight || image?.videoHeight || image?.height || 0;
+  if (!width || !height) return 0;
+  let bytes = 0;
+  do {
+    bytes += width * height * 4; // RGBA8 upper-bound for browser image uploads
+    if (!texture.generateMipmaps || (width === 1 && height === 1)) break;
+    width = Math.max(1, Math.floor(width / 2));
+    height = Math.max(1, Math.floor(height / 2));
+  } while (true);
+  return bytes;
+}
+
+function estimateGeometryGpuBytes(root) {
+  const seen = new Set();
+  let bytes = 0;
+  root.traverse((object) => {
+    const geometry = object.geometry;
+    if (!geometry || seen.has(geometry)) return;
+    seen.add(geometry);
+    for (const attribute of Object.values(geometry.attributes)) {
+      bytes += attribute.array?.byteLength || 0;
+    }
+    bytes += geometry.index?.array?.byteLength || 0;
+  });
+  return bytes;
+}
+
+function estimateRenderTargetGpuBytes() {
+  const targets = [
+    composer.renderTarget1,
+    composer.renderTarget2,
+    bloomPass.renderTargetBright,
+    ...bloomPass.renderTargetsHorizontal,
+    ...bloomPass.renderTargetsVertical,
+  ];
+  let bytes = renderer.domElement.width * renderer.domElement.height * 4; // one RGBA8 backbuffer
+  for (const target of targets) {
+    const pixels = target.width * target.height;
+    const hasDepth = target.depthBuffer ? 4 : 0;
+    bytes += pixels * (8 + hasDepth); // RGBA16F color + optional depth
+    if (target.samples > 0) bytes += pixels * target.samples * (8 + hasDepth);
+  }
+  return bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,9 +378,14 @@ const params = {
   nightIntensity: 1.0,
 
   // Clouds
-  cloudDrift: 0.035,   // rad/s of differential drift
+  cloudDrift: 0.004,   // rad/s; tuned for the accelerated globe spin
   cloudOpacity: 1.0,
-  cloudRelief: 1.0,
+  cloudRelief: 1.55,
+  cloudDetail: 1.0,
+  lightningIntensity: 0.65,
+  showCloudDeck: true,
+  showHighClouds: true,
+  showAtmosphere: true,
 
   // Planetary spin
   // A planet that never stops turning is the wrong default for anyone who has
@@ -288,6 +393,10 @@ const params = {
   // the media query rather than overriding it.
   autoRotation: !prefersReducedMotion,
   rotationSpeed: 0.018,
+
+  // Explicitly simulated low-Earth-orbit overlay; warp is simulated seconds per real second.
+  showLEO: true,
+  leoTimeWarp: 60,
 
   // Post-processing
   exposure: 1.0,
@@ -313,6 +422,7 @@ const subsolarLabelEl = document.getElementById('subsolar-label');
 const fpsLabelEl = document.getElementById('fps-label');
 const studioEl = document.getElementById('studio');
 const studioToggleBtn = document.getElementById('studio-toggle');
+let initializeStudioControls = null;
 
 function updateModeBadge() {
   if (params.liveUTC) {
@@ -325,11 +435,21 @@ function updateModeBadge() {
 }
 
 if (studioToggleBtn && studioEl) {
-  studioToggleBtn.addEventListener('click', () => {
+  studioToggleBtn.addEventListener('click', async () => {
     const isHidden = studioEl.hasAttribute('hidden');
     if (isHidden) {
       studioEl.removeAttribute('hidden');
       studioToggleBtn.setAttribute('aria-expanded', 'true');
+      if (initializeStudioControls) {
+        studioEl.setAttribute('aria-busy', 'true');
+        try {
+          await initializeStudioControls();
+        } catch (err) {
+          reportFatal(`Could not load studio controls: ${err.message || String(err)}`);
+        } finally {
+          studioEl.removeAttribute('aria-busy');
+        }
+      }
     } else {
       studioEl.setAttribute('hidden', '');
       studioToggleBtn.setAttribute('aria-expanded', 'false');
@@ -387,13 +507,82 @@ async function init() {
   ]);
 
   const earth = createEarth({ day, night, specular, topology, clouds });
+  earth.clouds.visible = params.showCloudDeck;
+  earth.cirrus.visible = params.showHighClouds;
+  earth.halo.visible = params.showAtmosphere;
   scene.add(earth.group);
+
+  const leoTracker = createLEOTracker(earth.group, earth.spin);
+  leoTracker.setVisible(params.showLEO);
+
+  const leoPanelEl = document.getElementById('leo-panel');
+  const leoToggleBtn = document.getElementById('leo-toggle');
+  const leoCloseBtn = document.getElementById('leo-close');
+  const leoVisibilityBtn = document.getElementById('leo-visibility');
+  const leoTrackBtn = document.getElementById('leo-track');
+  const leoAltitudeEl = document.getElementById('leo-altitude');
+  const leoSpeedEl = document.getElementById('leo-speed');
+  const leoPeriodEl = document.getElementById('leo-period');
+  const leoInclinationEl = document.getElementById('leo-inclination');
+  const leoCoordinatesEl = document.getElementById('leo-coordinates');
+  const leoPhaseEl = document.getElementById('leo-phase');
+  const leoWarpLabelEl = document.getElementById('leo-warp-label');
+  const leoSunStatusEl = document.getElementById('leo-sun-status');
+  const leoSunLabelEl = document.getElementById('leo-sun-label');
+  let leoVisibilityController = null;
+  let cameraTrackingLEO = false;
+
+  function setLEOPanelOpen(open) {
+    if (!leoPanelEl) return;
+    leoPanelEl.hidden = !open;
+    leoToggleBtn?.setAttribute('aria-expanded', String(open));
+    leoToggleBtn?.setAttribute('title', open ? 'Close simulated LEO tracker' : 'Open simulated LEO tracker');
+  }
+
+  function setLEOCameraTracking(enabled, { preserveTarget = false } = {}) {
+    cameraTrackingLEO = Boolean(enabled);
+    if (cameraTrackingLEO && !params.showLEO) setLEOVisibility(true);
+    if (!cameraTrackingLEO && !preserveTarget) controls.target.set(0, 0, 0);
+    leoTrackBtn?.setAttribute('aria-pressed', String(cameraTrackingLEO));
+    if (leoTrackBtn) leoTrackBtn.textContent = cameraTrackingLEO ? 'STOP TRACKING' : 'TRACK SATELLITE';
+  }
+
+  function setLEOVisibility(visible) {
+    params.showLEO = Boolean(visible);
+    leoTracker.setVisible(params.showLEO);
+    leoVisibilityController?.updateDisplay();
+    if (!params.showLEO && cameraTrackingLEO) setLEOCameraTracking(false);
+    leoVisibilityBtn?.setAttribute('aria-pressed', String(params.showLEO));
+    if (leoVisibilityBtn) leoVisibilityBtn.textContent = params.showLEO ? 'HIDE ORBIT' : 'SHOW ORBIT';
+  }
+
+  leoToggleBtn?.addEventListener('click', () => setLEOPanelOpen(Boolean(leoPanelEl?.hidden)));
+  leoCloseBtn?.addEventListener('click', () => {
+    setLEOPanelOpen(false);
+    leoToggleBtn?.focus({ preventScroll: true });
+  });
+  leoVisibilityBtn?.addEventListener('click', () => setLEOVisibility(!params.showLEO));
+  leoTrackBtn?.addEventListener('click', () => setLEOCameraTracking(!cameraTrackingLEO));
+
+  if (leoAltitudeEl) leoAltitudeEl.textContent = LEO_ALTITUDE_KM.toFixed(0);
+  if (leoSpeedEl) leoSpeedEl.textContent = LEO_ORBITAL_SPEED_KM_S.toFixed(2);
+  if (leoPeriodEl) leoPeriodEl.textContent = `${LEO_ORBITAL_PERIOD_MINUTES.toFixed(1)} MIN`;
+  if (leoInclinationEl) leoInclinationEl.textContent = LEO_INCLINATION_DEG.toFixed(1);
 
   const beacons = createBeacons(pixelRatio, earth.uniforms.shared.uSunDirection);
   earth.spin.add(beacons);
 
   const starfield = createStarfield(pixelRatio, { count: 16000 });
   scene.add(starfield.group);
+
+  // Optional browser-side profiler: image mips, vertex/index buffers, and
+  // post-process targets are estimated separately from the driver's own counts.
+  const profileAssetGpuBytes = profileMode
+    ? [day, night, specular, topology, clouds].reduce((sum, texture) => sum + estimateTextureGpuBytes(texture), 0)
+    : 0;
+  const profileGeometryGpuBytes = profileMode ? estimateGeometryGpuBytes(scene) : 0;
+  let profileRenderStats = { calls: 0, triangles: 0, points: 0 };
+  let profileSubmitMs = 0;
 
   onPixelRatioChanged = () => {
     beacons.material.uniforms.uPixelRatio.value = pixelRatio;
@@ -410,67 +599,121 @@ async function init() {
   } catch {
     renderer.compile(scene, camera);
   }
+  if (profileMode) renderer.info.reset();
 
   // -------------------------------------------------------------------------
-  // Studio GUI
+  // Studio GUI (loaded only on demand)
   // -------------------------------------------------------------------------
-  const gui = new GUI({ container: studioEl, title: 'Studio Controls' });
+  let gui = null;
+  let studioInitialization = null;
+  let autoRotationController = null;
+  let isCityMode = false;
+  let autoRotationBeforeFly = params.autoRotation;
 
-  const solarFolder = gui.addFolder('Solar & Ephemeris');
-  const liveUtcController = solarFolder.add(params, 'liveUTC').name('Real-Time UTC Sync').onChange(updateModeBadge);
+  const createStudioControls = async () => {
+    if (gui) return;
+    if (studioInitialization) return studioInitialization;
 
-  solarFolder
-    .add(params, 'sunLongitude', -180, 180, 0.1)
-    .name('Sun Longitude (°)')
-    .listen()
-    .onChange(() => {
-      params.liveUTC = false;
-      liveUtcController.updateDisplay();
-      updateModeBadge();
-    });
+    studioInitialization = (async () => {
+      const { default: GUI } = await import('lil-gui');
+      gui = new GUI({ container: studioEl, title: 'Studio Controls' });
 
-  solarFolder
-    .add(params, 'sunLatitude', -23.5, 23.5, 0.1)
-    .name('Sun Latitude (°)')
-    .listen()
-    .onChange(() => {
-      params.liveUTC = false;
-      liveUtcController.updateDisplay();
-      updateModeBadge();
-    });
+      const solarFolder = gui.addFolder('Solar & Ephemeris');
+      const liveUtcController = solarFolder.add(params, 'liveUTC').name('Real-Time UTC Sync').onChange(updateModeBadge);
 
-  solarFolder.add(params, 'sunIntensity', 0.2, 2.5, 0.01).name('Sun Intensity');
+      solarFolder
+        .add(params, 'sunLongitude', -180, 180, 0.1)
+        .name('Sun Longitude (°)')
+        .listen()
+        .onChange(() => {
+          params.liveUTC = false;
+          liveUtcController.updateDisplay();
+          updateModeBadge();
+        });
 
-  const atmosphereFolder = gui.addFolder('Atmosphere & Scattering');
-  atmosphereFolder.add(params, 'atmosphereIntensity', 0.0, 2.5, 0.05).name('Rayleigh Density');
-  atmosphereFolder.add(params, 'nightIntensity', 0.0, 3.0, 0.05).name('City Emission');
+      solarFolder
+        .add(params, 'sunLatitude', -23.5, 23.5, 0.1)
+        .name('Sun Latitude (°)')
+        .listen()
+        .onChange(() => {
+          params.liveUTC = false;
+          liveUtcController.updateDisplay();
+          updateModeBadge();
+        });
 
-  const oceanFolder = gui.addFolder('Ocean & Terrain');
-  oceanFolder.add(params, 'specularIntensity', 0.0, 3.0, 0.05).name('Sun Glitter');
-  oceanFolder.add(params, 'oceanRoughness', 0.02, 0.45, 0.005).name('Sea Roughness');
-  oceanFolder.add(params, 'waveStrength', 0.0, 2.5, 0.05).name('Wave Detail');
-  oceanFolder.add(params, 'detailStrength', 0.0, 2.5, 0.05).name('Terrain Detail');
-  oceanFolder.add(params, 'bumpScale', 0.0, 3.0, 0.05).name('Relief Strength');
+      solarFolder.add(params, 'sunIntensity', 0.2, 2.5, 0.01).name('Sun Intensity');
 
-  const cloudsFolder = gui.addFolder('Cloud Decks');
-  cloudsFolder.add(params, 'cloudDrift', -0.15, 0.15, 0.001).name('Zonal Drift');
-  cloudsFolder.add(params, 'cloudOpacity', 0.0, 1.0, 0.01).name('Cloud Density');
-  cloudsFolder.add(params, 'cloudRelief', 0.0, 2.5, 0.05).name('Cumulus Relief');
+      const atmosphereFolder = gui.addFolder('Atmosphere & Scattering');
+      atmosphereFolder.add(params, 'atmosphereIntensity', 0.0, 2.5, 0.05).name('Rayleigh Density');
+      atmosphereFolder.add(params, 'showAtmosphere').name('Scattering Limb').onChange((visible) => {
+        earth.halo.visible = visible;
+      });
+      atmosphereFolder.add(params, 'nightIntensity', 0.0, 3.0, 0.05).name('City Emission');
 
-  const dynamicsFolder = gui.addFolder('Orbital Dynamics');
-  dynamicsFolder.add(params, 'autoRotation').name('Axial Auto-Spin');
-  dynamicsFolder.add(params, 'rotationSpeed', -0.08, 0.08, 0.001).name('Spin Velocity');
+      const oceanFolder = gui.addFolder('Ocean & Terrain');
+      oceanFolder.add(params, 'specularIntensity', 0.0, 3.0, 0.05).name('Sun Glitter');
+      oceanFolder.add(params, 'oceanRoughness', 0.02, 0.45, 0.005).name('Sea Roughness');
+      oceanFolder.add(params, 'waveStrength', 0.0, 2.5, 0.05).name('Wave Detail');
+      oceanFolder.add(params, 'detailStrength', 0.0, 2.5, 0.05).name('Terrain Detail');
+      oceanFolder.add(params, 'bumpScale', 0.0, 3.0, 0.05).name('Relief Strength');
 
-  const postFolder = gui.addFolder('Optics & Post');
-  postFolder.add(params, 'exposure', 0.4, 2.0, 0.01).name('Exposure').onChange((v) => (renderer.toneMappingExposure = v));
-  postFolder.add(params, 'bloomStrength', 0.0, 2.0, 0.01).name('Bloom Strength').onChange((v) => (bloomPass.strength = v));
-  postFolder.add(params, 'bloomRadius', 0.0, 1.0, 0.01).name('Bloom Radius').onChange((v) => (bloomPass.radius = v));
-  postFolder.add(params, 'bloomThreshold', 0.0, 2.0, 0.01).name('Bloom Threshold').onChange((v) => (bloomPass.threshold = v));
-  postFolder.add(params, 'showBeacons').name('Orbital Beacons').onChange((v) => (beacons.visible = v));
-  postFolder.add(params, 'beaconIntensity', 0.0, 3.0, 0.05).name('Beacon Power');
-  postFolder.add(params, 'showStarfield').name('Star Field').onChange((v) => (starfield.group.visible = v));
-  postFolder.add(params, 'starfieldOpacity', 0.0, 2.0, 0.01).name('Star Brightness');
-  postFolder.add(params, 'milkyWayIntensity', 0.0, 3.0, 0.01).name('Milky Way');
+      const cloudsFolder = gui.addFolder('Cloud Decks');
+      cloudsFolder.add(params, 'cloudDrift', -0.012, 0.012, 0.0001).name('Zonal Drift');
+      cloudsFolder.add(params, 'cloudOpacity', 0.0, 1.0, 0.01).name('Cloud Density');
+      cloudsFolder.add(params, 'cloudRelief', 0.0, 2.5, 0.05).name('Cumulus Relief');
+      cloudsFolder.add(params, 'cloudDetail', 0.0, 1.5, 0.05).name('Cloud Microdetail');
+      cloudsFolder.add(params, 'lightningIntensity', 0.0, 1.5, 0.05).name('Night Storm Flashes');
+      cloudsFolder.add(params, 'showCloudDeck').name('Main Deck').onChange((visible) => {
+        earth.clouds.visible = visible;
+      });
+      cloudsFolder.add(params, 'showHighClouds').name('High Ice Veil').onChange((visible) => {
+        earth.cirrus.visible = visible;
+      });
+
+      const dynamicsFolder = gui.addFolder('Orbital Dynamics');
+      autoRotationController = dynamicsFolder.add(params, 'autoRotation').name('Axial Auto-Spin');
+      autoRotationController.onChange((enabled) => {
+        if (isCityMode) autoRotationBeforeFly = enabled;
+      });
+      dynamicsFolder.add(params, 'rotationSpeed', -0.08, 0.08, 0.001).name('Spin Velocity');
+      leoVisibilityController = dynamicsFolder.add(params, 'showLEO').name('Simulated LEO Orbit').onChange(setLEOVisibility);
+      dynamicsFolder.add(params, 'leoTimeWarp', 0, 240, 1).name('LEO Time Warp');
+
+      const postFolder = gui.addFolder('Optics & Post');
+      postFolder.add(params, 'exposure', 0.4, 2.0, 0.01).name('Exposure').onChange((v) => (renderer.toneMappingExposure = v));
+      postFolder.add(params, 'bloomStrength', 0.0, 2.0, 0.01).name('Bloom Strength').onChange((v) => (bloomPass.strength = v));
+      postFolder.add(params, 'bloomRadius', 0.0, 1.0, 0.01).name('Bloom Radius').onChange((v) => (bloomPass.radius = v));
+      postFolder.add(params, 'bloomThreshold', 0.0, 2.0, 0.01).name('Bloom Threshold').onChange((v) => (bloomPass.threshold = v));
+      postFolder.add(params, 'showBeacons').name('Orbital Beacons').onChange((v) => (beacons.visible = v));
+      postFolder.add(params, 'beaconIntensity', 0.0, 3.0, 0.05).name('Beacon Power');
+      postFolder.add(params, 'showStarfield').name('Star Field').onChange((v) => (starfield.group.visible = v));
+      postFolder.add(params, 'starfieldOpacity', 0.0, 2.0, 0.01).name('Star Brightness');
+      postFolder.add(params, 'milkyWayIntensity', 0.0, 3.0, 0.01).name('Milky Way');
+    })();
+
+    try {
+      await studioInitialization;
+    } catch (err) {
+      gui?.destroy();
+      gui = null;
+      studioInitialization = null;
+      throw err;
+    }
+  };
+
+  initializeStudioControls = createStudioControls;
+  // A visitor may open the panel before the Earth assets finish loading. Honor
+  // that intent once its controls become available.
+  if (studioEl && !studioEl.hasAttribute('hidden')) {
+    studioEl.setAttribute('aria-busy', 'true');
+    try {
+      await createStudioControls();
+    } catch (err) {
+      reportFatal(`Could not load studio controls: ${err.message || String(err)}`);
+    } finally {
+      studioEl.removeAttribute('aria-busy');
+    }
+  }
 
   // -------------------------------------------------------------------------
   // City Navigation & Telemetry
@@ -487,18 +730,48 @@ async function init() {
   const cityDescEl = document.getElementById('city-desc');
   const cityLandmarksEl = document.getElementById('city-landmarks');
   const btnReturnOrbit = document.getElementById('btn-return-orbit');
+  const btnNavReturnOrbit = document.getElementById('btn-nav-return-orbit');
   const cityCardClose = document.getElementById('city-card-close');
   const altitudeLabelEl = document.getElementById('altitude-label');
 
   let activeCity = null;
   let isFlying = false;
-  let autoRotationBeforeFly = params.autoRotation;
   let flyStartTime = 0;
   let flyDuration = 2000;
   const flyStartPos = new THREE.Vector3();
   const flyEndPos = new THREE.Vector3();
   const flyStartTarget = new THREE.Vector3();
   const flyEndTarget = new THREE.Vector3();
+
+  function setAutoRotation(enabled) {
+    params.autoRotation = enabled;
+    autoRotationController?.updateDisplay();
+  }
+
+  function updateCitySelection(city) {
+    cityNavScrollEl?.querySelectorAll('.city-chip').forEach((btn) => {
+      const selected = btn.getAttribute('data-city') === city?.id;
+      btn.classList.toggle('active', selected);
+      btn.setAttribute('aria-pressed', String(selected));
+    });
+  }
+
+  function updateCityModeControls() {
+    if (leoTrackBtn) leoTrackBtn.disabled = isCityMode;
+    if (!btnNavReturnOrbit) return;
+    const detailsVisible = cityCardEl && !cityCardEl.hasAttribute('hidden');
+    btnNavReturnOrbit.hidden = !isCityMode || Boolean(detailsVisible);
+  }
+
+  function focusCityChip(city) {
+    if (!city || !cityNavScrollEl) return;
+    for (const btn of cityNavScrollEl.querySelectorAll('.city-chip')) {
+      if (btn.getAttribute('data-city') === city.id) {
+        btn.focus({ preventScroll: true });
+        return;
+      }
+    }
+  }
 
   function getCityWorldPosition(city, radius = 1.0) {
     earth.group.updateMatrixWorld(true);
@@ -508,7 +781,11 @@ async function init() {
 
   function showCityCard(city) {
     activeCity = city;
-    if (!cityCardEl) return;
+    updateCitySelection(city);
+    if (!cityCardEl) {
+      updateCityModeControls();
+      return;
+    }
     cityCardEl.removeAttribute('hidden');
 
     if (citySectorEl) citySectorEl.textContent = `${city.countryAr} • ${city.sectorAr}`;
@@ -536,22 +813,21 @@ async function init() {
       });
     }
 
-    document.querySelectorAll('.city-chip').forEach((btn) => {
-      btn.classList.toggle('active', btn.getAttribute('data-city') === city.id);
-    });
+    updateCityModeControls();
   }
 
-  function hideCityCard() {
-    activeCity = null;
+  function dismissCityCard() {
     cityCardEl?.setAttribute('hidden', '');
-    document.querySelectorAll('.city-chip').forEach((btn) => btn.classList.remove('active'));
+    updateCityModeControls();
   }
 
   function flyToCity(city) {
-    activeCity = city;
-    // Remember the spin state so returning to orbit can restore it exactly.
-    autoRotationBeforeFly = params.autoRotation;
-    params.autoRotation = false;
+    setLEOCameraTracking(false, { preserveTarget: true });
+    // Preserve the original spin preference when moving between cities or
+    // reopening a dismissed card; only snapshot it on the first entry.
+    if (!isCityMode) autoRotationBeforeFly = params.autoRotation;
+    isCityMode = true;
+    setAutoRotation(false);
 
     const cityWorldPos = getCityWorldPosition(city, 1.0);
     const earthCenter = new THREE.Vector3().setFromMatrixPosition(earth.group.matrixWorld);
@@ -572,6 +848,8 @@ async function init() {
   }
 
   function resetToOrbit() {
+    setLEOCameraTracking(false, { preserveTarget: true });
+    const cityToFocus = activeCity;
     isFlying = true;
     flyStartTime = performance.now();
     flyDuration = 1800;
@@ -583,15 +861,28 @@ async function init() {
     flyEndPos.copy(currentDir.multiplyScalar(3.0));
     flyEndTarget.set(0, 0, 0);
 
-    hideCityCard();
-    // Restore whatever the spin state was before the visit, not a hardcoded
-    // `true`: a visitor who has asked for reduced motion must not be given a
-    // spinning planet as a reward for closing a card.
-    params.autoRotation = autoRotationBeforeFly;
+    isCityMode = false;
+    activeCity = null;
+    updateCitySelection(null);
+    dismissCityCard();
+    // Restore the visitor's pre-visit preference, unless reduced motion was
+    // enabled while they were in city mode.
+    setAutoRotation(autoRotationBeforeFly);
+    focusCityChip(cityToFocus);
   }
 
   btnReturnOrbit?.addEventListener('click', resetToOrbit);
-  cityCardClose?.addEventListener('click', hideCityCard);
+  btnNavReturnOrbit?.addEventListener('click', resetToOrbit);
+  cityCardClose?.addEventListener('click', () => {
+    dismissCityCard();
+    btnNavReturnOrbit?.focus({ preventScroll: true });
+  });
+
+  motionPreferenceQuery?.addEventListener('change', (event) => {
+    if (!event.matches) return;
+    if (isCityMode) autoRotationBeforeFly = false;
+    if (params.autoRotation) setAutoRotation(false);
+  });
 
   if (cityNavScrollEl) {
     CITIES.forEach((city) => {
@@ -599,7 +890,20 @@ async function init() {
       btn.className = 'city-chip';
       btn.type = 'button';
       btn.setAttribute('data-city', city.id);
-      btn.innerHTML = `<span class="city-chip-ar">${city.nameAr}</span><span class="city-chip-en">${city.name}</span>`;
+      btn.setAttribute('aria-pressed', 'false');
+
+      const nameAr = document.createElement('span');
+      nameAr.className = 'city-chip-ar';
+      nameAr.lang = 'ar';
+      nameAr.dir = 'rtl';
+      nameAr.textContent = city.nameAr;
+
+      const nameEn = document.createElement('span');
+      nameEn.className = 'city-chip-en';
+      nameEn.lang = 'en';
+      nameEn.textContent = city.name;
+
+      btn.append(nameAr, nameEn);
       btn.addEventListener('click', () => flyToCity(city));
       cityNavScrollEl.appendChild(btn);
     });
@@ -642,6 +946,23 @@ async function init() {
     const width = window.innerWidth;
     const height = window.innerHeight;
 
+    MAX_PIXEL_RATIO = maxPixelRatioForViewport(width, height);
+    const qualityTarget = qualityMode === 'ultra' ? MAX_PIXEL_RATIO : Math.min(1, MAX_PIXEL_RATIO);
+    if (Math.abs(qualityTarget - pixelRatio) > 0.001) {
+      applyPixelRatio(qualityTarget, { resize: false });
+      onPixelRatioChanged?.();
+    }
+    setMultisampling(canUseFloatMsaa({
+      width,
+      height,
+      pixelRatio,
+      maxSamples: gl.getParameter(gl.MAX_SAMPLES) || 0,
+      floatColorBuffer: renderer.extensions.has('EXT_color_buffer_float'),
+      coarsePointer,
+      deviceMemoryGiB,
+      disabled: msaaDisabledByQuery,
+    }));
+
     camera.aspect = width / height;
     camera.updateProjectionMatrix();
 
@@ -661,6 +982,8 @@ async function init() {
   const subsolarLocal = new THREE.Vector3();
   const sunWorldPos = new THREE.Vector3();
   const earthWorldCenter = new THREE.Vector3();
+  const leoWorldPosition = new THREE.Vector3();
+  const leoEarthRelativePosition = new THREE.Vector3();
   const flyDir = new THREE.Vector3();
   // Scratch objects for the fly-to interpolation (see the loop body).
   const Z_AXIS = new THREE.Vector3(0, 0, 1);
@@ -688,6 +1011,8 @@ async function init() {
   let refreshRate = 60;
   const probeFrames = [];
   let fpsSmoothed = 0;
+  let slowWindows = 0;
+  let fastWindows = 0;
 
   /** Rolling median of the refresh probe; robust to a couple of dropped frames. */
   function measureRefreshRate(dt) {
@@ -801,6 +1126,19 @@ async function init() {
     earthWorldCenter.setFromMatrixPosition(earth.group.matrixWorld);
     sunWorldPos.copy(subsolarLocal).sub(earthWorldCenter).normalize();
 
+    const leoTelemetry = leoTracker.update(
+      elapsedTime * params.leoTimeWarp,
+      earth.spin.rotation.y,
+      camera.position.length(),
+    );
+    leoWorldPosition.copy(leoTelemetry.position).applyMatrix4(earth.group.matrixWorld);
+    leoEarthRelativePosition.copy(leoWorldPosition).sub(earthWorldCenter);
+    leoTelemetry.eclipse = isSatelliteEclipsed(leoEarthRelativePosition, sunWorldPos);
+    if (cameraTrackingLEO) {
+      controls.target.copy(leoWorldPosition);
+      controls.update();
+    }
+
     // --- Uniform sync ------------------------------------------------------
     const camDist = camera.position.length();
     const shared = earth.uniforms.shared;
@@ -821,7 +1159,9 @@ async function init() {
     earth.uniforms.surface.uDetailStrength.value = params.detailStrength;
 
     earth.uniforms.clouds.uCloudRelief.value = params.cloudRelief;
-    earth.uniforms.cirrus.uCloudRelief.value = params.cloudRelief * 0.55;
+    earth.uniforms.clouds.uCloudDetail.value = params.cloudDetail;
+    earth.uniforms.clouds.uLightningIntensity.value = params.lightningIntensity;
+    earth.uniforms.cirrus.uCloudDetail.value = params.cloudDetail;
 
     beacons.material.uniforms.uTime.value = elapsed;
     beacons.material.uniforms.uIntensity.value = params.beaconIntensity;
@@ -831,8 +1171,20 @@ async function init() {
 
     // --- Render ------------------------------------------------------------
     // While the context is gone there is nothing to draw into, and issuing draw
-    // calls against a lost context produces an error per call.
+    // calls against a lost context produces an error per call. Profiling records
+    // the complete composer (scene + bloom + output/AA), not just the scene pass.
+    const renderStarted = profileMode ? performance.now() : 0;
     if (!contextLost) composer.render();
+    if (profileMode) {
+      const submitMs = performance.now() - renderStarted;
+      profileSubmitMs = profileSubmitMs === 0 ? submitMs : profileSubmitMs * 0.8 + submitMs * 0.2;
+      profileRenderStats = {
+        calls: renderer.info.render.calls,
+        triangles: renderer.info.render.triangles,
+        points: renderer.info.render.points,
+      };
+      renderer.info.reset();
+    }
 
     // One clock read for the whole frame. It has to be declared before the HUD
     // block that reads it: `const` is hoisted into the temporal dead zone, so
@@ -871,6 +1223,15 @@ async function init() {
       }
 
       if (activeCity && cityTimeEl) writeText(cityTimeEl, getCityLocalTime(activeCity, now));
+
+      if (leoPanelEl && !leoPanelEl.hidden) {
+        if (leoCoordinatesEl) writeText(leoCoordinatesEl, formatLatLng(leoTelemetry.latitude, leoTelemetry.longitude));
+        if (leoPhaseEl) writeText(leoPhaseEl, `${(leoTelemetry.phase * 100).toFixed(1)}%`);
+        if (leoWarpLabelEl) writeText(leoWarpLabelEl, `· ${params.leoTimeWarp.toFixed(0)}×`);
+        leoSunStatusEl?.classList.toggle('eclipse', leoTelemetry.eclipse);
+        leoSunStatusEl?.classList.toggle('sunlit', !leoTelemetry.eclipse);
+        if (leoSunLabelEl) writeText(leoSunLabelEl, leoTelemetry.eclipse ? 'ECLIPSE' : 'SUNLIT');
+      }
     }
 
     // --- FPS + adaptive resolution ----------------------------------------
@@ -879,7 +1240,25 @@ async function init() {
       const fps = Math.round((frameCount * 1000) / (nowPerf - lastFpsUpdate));
       // Seed from the first real sample rather than a guessed 60.
       fpsSmoothed = fpsSmoothed === 0 ? fps : fpsSmoothed * 0.6 + fps * 0.4;
-      if (fpsLabelEl) fpsLabelEl.textContent = `${fps} FPS`;
+      if (fpsLabelEl) {
+        if (profileMode) {
+          const renderTargetMiB = estimateRenderTargetGpuBytes() / (1024 * 1024);
+          const gpuEstimateMiB =
+            (profileAssetGpuBytes + profileGeometryGpuBytes + estimateRenderTargetGpuBytes()) / (1024 * 1024);
+          const jsHeapMiB = performance.memory?.usedJSHeapSize
+            ? ` · JS ${ (performance.memory.usedJSHeapSize / (1024 * 1024)).toFixed(0) } MiB`
+            : '';
+          fpsLabelEl.textContent =
+            `FPS ${fps} (${(1000 / Math.max(fps, 1)).toFixed(1)} ms) · DPR ${pixelRatio.toFixed(2)} · ` +
+            `${profileRenderStats.calls} draws · ${(profileRenderStats.triangles / 1e6).toFixed(2)}M tris · ` +
+            `${renderer.info.memory.textures} textures / ${renderer.info.memory.geometries} geometries · ` +
+            `GPU est ${gpuEstimateMiB.toFixed(0)} MiB (${renderTargetMiB.toFixed(0)} MiB targets) · ` +
+            `CPU submit ${profileSubmitMs.toFixed(1)} ms${jsHeapMiB}`;
+          fpsLabelEl.title = 'GPU memory is estimated from uncompressed RGBA8 textures and render targets; submit time is CPU-side, not a GPU timer.';
+        } else {
+          fpsLabelEl.textContent = `${fps} FPS`;
+        }
+      }
       frameCount = 0;
       lastFpsUpdate = nowPerf;
 
@@ -887,16 +1266,34 @@ async function init() {
       // only taken after two consecutive samples agree. Without that dwell the
       // controller oscillates: stepping down buys enough headroom to trip the
       // step-up rule, which loses it again a few seconds later.
-      if (qualityMode === 'ultra' && nowPerf - lastAdapt > ADAPT_DWELL_MS) {
+      if (qualityMode === 'ultra') {
         const low = refreshRate * 0.75;
         const high = refreshRate * 0.92;
-        if (fpsSmoothed < low && pixelRatio > adaptiveFloor + 0.02) {
+        if (fpsSmoothed < low) {
+          slowWindows += 1;
+          fastWindows = 0;
+        } else if (fpsSmoothed > high) {
+          fastWindows += 1;
+          slowWindows = 0;
+        } else {
+          slowWindows = 0;
+          fastWindows = 0;
+        }
+
+        if (nowPerf - lastAdapt > ADAPT_DWELL_MS && slowWindows >= 2 && pixelRatio > adaptiveFloor + 0.02) {
           applyPixelRatio(pixelRatio - 0.2);
           lastAdapt = nowPerf;
-        } else if (fpsSmoothed > high && pixelRatio < MAX_PIXEL_RATIO - 0.02) {
+          slowWindows = 0;
+          fastWindows = 0;
+        } else if (nowPerf - lastAdapt > ADAPT_DWELL_MS && fastWindows >= 2 && pixelRatio < MAX_PIXEL_RATIO - 0.02) {
           applyPixelRatio(pixelRatio + 0.15);
           lastAdapt = nowPerf;
+          slowWindows = 0;
+          fastWindows = 0;
         }
+      } else {
+        slowWindows = 0;
+        fastWindows = 0;
       }
     }
   }

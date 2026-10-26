@@ -13,8 +13,6 @@ const float PL_H_MIE      = 0.00019;    // 1.2 km
 const vec3  PL_BETA_R     = vec3(36.9, 86.0, 211.0);
 const vec3  PL_BETA_M     = vec3(133.8);
 const float PL_MIE_G      = 0.76;
-const float PL_ATM_TOP    = 1.028;      // render shell, ~178 km
-const float PL_ATM_DENSITY = 1.0 / 0.016; // visual thickness gain for the limb
 
 // Rayleigh phase: 3/(16π) (1 + μ²)
 float rayleighPhase(float mu) {
@@ -37,18 +35,23 @@ float relativeAirMass(float cosZenith) {
   return min(38.0, 1.0 / max(denom, 0.0015));
 }
 
-// Total vertical optical depth (unit air mass) of a clear atmosphere.
-vec3 atmosphereVerticalDepth() {
-  return PL_BETA_R * PL_H_RAYLEIGH + PL_BETA_M * PL_H_MIE;
+// Optical depth from a point at `altitude` (radii above the surface) along a
+// relative air mass. Rayleigh and aerosol densities have different scale
+// heights; applying the Rayleigh falloff to both makes high cloud and limb
+// samples carry too much aerosol extinction.
+vec3 atmosphereOpticalDepth(float altitude, float airMass) {
+  float h = max(altitude, 0.0);
+  float densityR = exp(-h / PL_H_RAYLEIGH);
+  float densityM = exp(-h / PL_H_MIE);
+  return (PL_BETA_R * PL_H_RAYLEIGH * densityR
+        + PL_BETA_M * PL_H_MIE * densityM) * max(airMass, 0.0);
 }
 
 // Transmittance from a point at `altitude` (radii above the surface) toward a
 // direction whose cosine with the local up vector is `cosZenith`.
 vec3 atmosphereTransmittanceFrom(float altitude, float cosZenith) {
-  float density = exp(-max(altitude, 0.0) / PL_H_RAYLEIGH);
-  float m = relativeAirMass(cosZenith) * density;
-  vec3 depth = atmosphereVerticalDepth() * m;
-  return exp(-depth);
+  float airMass = relativeAirMass(cosZenith);
+  return exp(-atmosphereOpticalDepth(altitude, airMass));
 }
 
 // Sunlight reaching the top of the atmosphere, already reddened by grazing
