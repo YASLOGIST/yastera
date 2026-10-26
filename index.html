@@ -30,22 +30,59 @@
           </svg>
           <span class="visually-hidden">Studio controls</span>
         </button>
+        <button type="button" class="icon-button leo-toggle" id="leo-toggle" aria-expanded="false" aria-controls="leo-panel" title="Open simulated LEO tracker">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="m8.3 8.3 7.4 7.4M6.1 3.5l3.1 3.1-3.6 3.6-3.1-3.1zM17.9 20.5l-3.1-3.1 3.6-3.6 3.1 3.1zM14.8 9.2l-5.6 5.6M17.4 4.5a2.3 2.3 0 0 1 2.1 2.1M4.5 17.4a2.3 2.3 0 0 1 2.1 2.1"/>
+          </svg>
+          <span class="visually-hidden">Simulated LEO satellite tracker</span>
+        </button>
       </div>
       <div id="studio" class="studio" hidden></div>
     </header>
 
+    <aside id="leo-panel" class="leo-panel" aria-label="Simulated low Earth orbit telemetry" hidden>
+      <div class="leo-panel-header">
+        <div>
+          <div class="leo-kicker">MISSION SIMULATION <span>·</span> LEO / 01</div>
+          <h2>ORBITAL TRACKER</h2>
+        </div>
+        <button type="button" class="leo-close" id="leo-close" aria-label="Close orbital tracker">×</button>
+      </div>
+      <div class="leo-status-row">
+        <span class="leo-status sunlit" id="leo-sun-status"><i aria-hidden="true"></i><span id="leo-sun-label">SUNLIT</span></span>
+        <span class="leo-orbit-tag">ISS-CLASS · CIRCULAR</span>
+      </div>
+      <div class="leo-stats">
+        <div class="leo-stat"><span>ALTITUDE</span><strong><span id="leo-altitude">—</span> <small>KM</small></strong></div>
+        <div class="leo-stat"><span>ORBITAL SPEED</span><strong><span id="leo-speed">—</span> <small>KM/S</small></strong></div>
+        <div class="leo-stat"><span>PERIOD</span><strong id="leo-period">—</strong></div>
+        <div class="leo-stat"><span>INCLINATION</span><strong><span id="leo-inclination">—</span><small>°</small></strong></div>
+        <div class="leo-stat leo-stat-wide"><span>GROUND TRACK</span><strong class="mono" id="leo-coordinates">—</strong></div>
+        <div class="leo-stat leo-stat-wide"><span>ORBIT PHASE <b id="leo-warp-label">· 60×</b></span><strong class="mono" id="leo-phase">—</strong></div>
+      </div>
+      <div class="leo-actions">
+        <button type="button" id="leo-visibility" aria-pressed="true">HIDE ORBIT</button>
+        <button type="button" id="leo-track" aria-pressed="false">TRACK SATELLITE</button>
+      </div>
+      <p class="leo-disclaimer">Illustrative, time-warped circular orbit—not live spacecraft data. The path uses the 420 km model; the marker is enlarged.</p>
+    </aside>
+
     <nav class="city-nav" id="city-nav" aria-label="Global Cities Navigation">
       <div class="city-nav-title">CITIES & HUBS</div>
       <div class="city-nav-scroll" id="city-nav-scroll"></div>
+      <button type="button" class="orbit-return" id="btn-nav-return-orbit" hidden title="Return to orbital view" aria-label="Return to orbital view">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 12h8m-3-3 3 3-3 3"/></svg>
+        <span>ORBIT VIEW</span>
+      </button>
     </nav>
 
     <article id="city-card" class="city-card" hidden aria-live="polite">
       <div class="city-card-header">
         <div>
-          <div class="city-card-badge" id="city-sector">SECTOR</div>
+          <div class="city-card-badge" id="city-sector" lang="ar" dir="rtl">SECTOR</div>
           <h2 class="city-card-title">
-            <span id="city-name-ar">المدينة</span>
-            <span class="city-card-sub" id="city-name-en">City, Country</span>
+            <span id="city-name-ar" lang="ar" dir="rtl">المدينة</span>
+            <span class="city-card-sub" id="city-name-en" lang="en">City, Country</span>
           </h2>
         </div>
         <button type="button" class="city-card-close" id="city-card-close" aria-label="Close city card">✕</button>
@@ -70,7 +107,7 @@
         </div>
       </div>
 
-      <p class="city-card-desc" id="city-desc">—</p>
+      <p class="city-card-desc" id="city-desc" lang="ar" dir="rtl">—</p>
       <div class="city-card-landmarks" id="city-landmarks"></div>
 
       <div class="city-card-actions">

@@ -29,14 +29,11 @@ in vec3 vCenterW;
 
 out vec4 fragColor;
 
-const int   MARCH_STEPS = 20;
-const float MARCH_HALF_WIDTH = 0.16;   // planet radii either side of closest approach
-
-float hash21(vec2 p) {
-  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
-  p3 += dot(p3, p3.yzx + 33.33);
-  return fract((p3.x + p3.y) * p3.z);
-}
+// Split the quadrature around closest approach. Altitude grows quadratically
+// away from that point, so squared-distance bins resolve the dense lower air
+// without increasing the 20-sample budget.
+const int MARCH_HALF_STEPS = 10;
+const int MARCH_STEPS = 2 * MARCH_HALF_STEPS;
 
 void main() {
   #include <logdepthbuf_fragment>
@@ -60,16 +57,15 @@ void main() {
   float hPl = b * b - cPl;
   if (hPl > 0.0) {
     float tPlanet = -b - sqrt(hPl);
-    if (tPlanet < tExit) discard;
+    if (tPlanet > 0.0 && tPlanet < tExit) discard;
   }
 
+  if (tExit <= 0.0) discard;
   float tEnter = max(-b - sqrtAtm, 0.0);
   float tClose = clamp(-b, tEnter, tExit);
-
-  float lo = max(tEnter, tClose - MARCH_HALF_WIDTH);
-  float hi = min(tExit, tClose + MARCH_HALF_WIDTH);
-  float stepLen = (hi - lo) / float(MARCH_STEPS);
-  if (stepLen <= 0.0) discard;
+  float leftSpan = max(tClose - tEnter, 0.0);
+  float rightSpan = max(tExit - tClose, 0.0);
+  if (leftSpan + rightSpan <= 1e-5) discard;
 
   vec3 L = normalize(uSunDirection);
   // Scattering cosine: the angle between where the light came from and where it
@@ -85,31 +81,43 @@ void main() {
   float mu = dot(rd, L);
   float phaseR = rayleighPhase(mu);
   float phaseM = hgPhase(mu, PL_MIE_G);
-  float jitter = hash21(gl_FragCoord.xy);
 
   vec3 sumR = vec3(0.0);
   vec3 sumM = vec3(0.0);
-  float hMin = 1e9;
+  vec3 closestPoint = ro + rd * tClose - center;
+  float hMin = max(length(closestPoint) - R, 0.0);
 
   for (int i = 0; i < MARCH_STEPS; i += 1) {
-    float t = lo + (float(i) + 0.5 + jitter) * stepLen;
+    bool beforeClosest = i < MARCH_HALF_STEPS;
+    int sampleIndex = beforeClosest ? i : i - MARCH_HALF_STEPS;
+    float binStart = float(sampleIndex) / float(MARCH_HALF_STEPS);
+    float binEnd = float(sampleIndex + 1) / float(MARCH_HALF_STEPS);
+    // Deterministic midpoint quadrature avoids a visible grain pattern on the
+    // narrow limb while the squared-distance mapping still resolves its density.
+    float u = (float(sampleIndex) + 0.5) / float(MARCH_HALF_STEPS);
+    float span = beforeClosest ? leftSpan : rightSpan;
+    float binWeight = span * (binEnd * binEnd - binStart * binStart);
+    float t = tClose + (beforeClosest ? -1.0 : 1.0) * span * u * u;
+
     vec3 p = ro + rd * t - center;
     float radius = length(p);
     float altitude = max(radius - R, 0.0);
-    hMin = min(hMin, altitude);
-
     float densityR = exp(-altitude / PL_H_RAYLEIGH);
     float densityM = exp(-altitude / PL_H_MIE);
 
     vec3 up = p / max(radius, 1e-5);
     float cosSun = dot(up, L);
-    // Sunlight reaching this sample, reddened by the air it crosses.
-    float sunMass = relativeAirMass(cosSun) * densityR;
-    vec3 sunT = exp(-(PL_BETA_R * PL_H_RAYLEIGH + PL_BETA_M * PL_H_MIE) * sunMass);
+    float cosView = dot(up, -rd);
+    // A single-scattered photon is attenuated on both legs: Sun -> sample and
+    // sample -> camera. The shared helper keeps aerosol and molecular falloff
+    // separate at each point in the shell.
+    vec3 sunT = atmosphereTransmittanceFrom(altitude, cosSun);
+    vec3 viewT = atmosphereTransmittanceFrom(altitude, cosView);
     float lit = smoothstep(-0.02, 0.12, cosSun);
+    vec3 pathT = sunT * viewT;
 
-    sumR += densityR * sunT * lit * stepLen;
-    sumM += densityM * sunT * lit * stepLen;
+    sumR += densityR * pathT * lit * binWeight;
+    sumM += densityM * pathT * lit * binWeight;
   }
 
   // The march accumulates optical depth along the chord, but a thin shell is
@@ -119,10 +127,10 @@ void main() {
   vec3 radiance = (PL_BETA_R * phaseR * sumR + PL_BETA_M * phaseM * sumM)
                 * uSunIntensity * uAtmosphereIntensity;
 
-  // Satellites photograph a faint green oxygen airglow band at ~95 km on the
-  // night limb (O I 557.7 nm). It is sun-independent emission.
-  float nightSide = 1.0 - smoothstep(-0.03, 0.18, dot(normalize(vPosW - center), L));
-  float airglow = exp(-pow((hMin - 0.0075) / 0.0045, 2.0));
+  // The green O I 557.7 nm nightglow peaks around 95 km, not at the surface.
+  // It is a faint, narrow emission layer and is independent of direct sunlight.
+  float nightSide = 1.0 - smoothstep(-0.03, 0.18, dot(normalize(closestPoint), L));
+  float airglow = exp(-pow((hMin - 0.0150) / 0.0035, 2.0));
   radiance += vec3(0.18, 0.85, 0.45) * airglow * nightSide * 0.030 * uAtmosphereIntensity;
 
   radiance = min(radiance, vec3(20.0));
@@ -130,6 +138,6 @@ void main() {
   // Fade the effect out as the camera dives into the atmosphere: from inside
   // the shell the limb is no longer a thin band, and the constant would have to
   // become a full sky model. The surface shader owns that regime.
-  float zoomFade = mix(0.35, 1.0, smoothstep(1.018, 1.35, uCameraDistance));
+  float zoomFade = smoothstep(1.012, 1.20, uCameraDistance);
   fragColor = vec4(radiance * zoomFade, 1.0);
 }

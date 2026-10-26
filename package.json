@@ -13,7 +13,11 @@
     "preview": "vite preview",
     "check:shaders": "node scripts/check-shaders.mjs",
     "check:runtime": "node scripts/check-runtime.mjs",
-    "check": "npm run check:shaders && npm run check:runtime"
+    "check:cities": "node scripts/check-cities.mjs",
+    "check:leo": "node scripts/check-leo.mjs",
+    "check:postprocessing": "node scripts/check-postprocessing.mjs",
+    "profile:rendering": "node scripts/profile-rendering.mjs",
+    "check": "npm run check:shaders && npm run check:runtime && npm run check:cities && npm run check:leo && npm run check:postprocessing"
   },
   "dependencies": {
     "lil-gui": "^0.21.0",

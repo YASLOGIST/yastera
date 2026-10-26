@@ -1,8 +1,9 @@
 # Orbital Earth 🌍
 
-A physically based, real-time **Orbital Earth** render. Everything you see is solved
-per pixel from real NASA imagery and standard atmospheric physics — there is no baked
-lighting in the maps, and no placeholders anywhere in the scene.
+A physically based, real-time **Orbital Earth** simulation. Earth illumination, cloud
+shading and atmospheric scattering are rendered from Earth imagery and analytic
+approximations rather than baked scene lighting. Mission overlays such as the LEO
+tracker are clearly labeled simulations unless they are connected to a live data source.
 
 Built with **Three.js**, hand-written **GLSL ES 3.00** shaders, and **Vite**.
 
@@ -14,10 +15,10 @@ Built with **Three.js**, hand-written **GLSL ES 3.00** shaders, and **Vite**.
 
 | Layer | Radius | What it is |
 | --- | --- | --- |
-| Surface | `1.000` | land + ocean, shaded per pixel |
-| Cloud deck | `1.0022` | tropospheric clouds (~14 km) |
-| Cirrus deck | `1.0041` | procedural high ice clouds (~26 km) |
-| Atmosphere | `1.028` | single-scattering limb (~178 km) |
+| Surface | `1.0000` | land + ocean, shaded per pixel |
+| Cloud tops | `1.0020` | shaped tropospheric clouds (~13 km) |
+| Upper cloud veil | `1.0027` | high anvils / cirrus approximation (~17 km) |
+| Atmosphere | `1.0280` | single-scattering limb (~178 km) |
 
 **Surface** — the albedo map is deliberately un-lit; relief, ocean optics, cloud
 shadows and haze are all computed in the fragment shader.
@@ -35,27 +36,33 @@ shadows and haze are all computed in the fragment shader.
 - **Night side**: Black Marble emission with the sensor's airglow pedestal removed,
   cloud occlusion and the underglow that clouds over a city catch in real ISS photos.
 
-**Cloud deck** — lit like a participating medium rather than a white sprite:
+**Cloud deck** — the redundant lower shell was removed: it repeated the same
+2D coverage map and added opacity without adding observed cloud-height data.
+The remaining main deck and upper veil each have a distinct role:
 
-- Shading normal derived from the density gradient (analytic tangent frame).
-- Three-tap march toward the sun for self-shadowing, so cumulus cores fall into
-  shade and edges glow.
-- Henyey–Greenstein forward phase → silver lining when backlit.
-- Sub-texel structure fades with the screen footprint of a texel (no aliasing).
-
-**Cirrus deck** — generated on the sphere *at render time*: a second texture tap
-would inherit the source mosaic's latitude stretch and its tile seams. Fibrous,
-jet-stream-stretched, independently drifting.
+- Coverage stays soft in orbit, then resolves into cloud puffs and clear gaps on
+  descent instead of magnifying into grey smoke.
+- Shading normals follow the cloud-density gradient; a three-tap, latitude-aware
+  sunward march adds self-shadowing without distorting longitude/latitude distances.
+- The high veil is restricted to dense storm systems and uses a faster upper-level
+  drift plus globe-local ice filaments. Rare, soft night flashes are tied to dense
+  storm cells rather than placed randomly across the globe. These are approximations,
+  not a separate satellite-observed cloud-height map.
+- Screen-footprint LOD filters procedural detail to avoid UV seams, polar pinching
+  and sub-pixel shimmer. Studio controls expose microdetail and let you compare
+  the main deck, high veil and atmospheric limb independently.
 
 **Atmosphere** — a real single-scattering march:
 
 - Only rays that *miss* the planet are integrated; rays that hit the surface get
   their airlight from the surface shader (otherwise the scattering is counted twice
   and the disc turns milky).
-- The sample points concentrate around the ray's closest approach, because Earth's
-  atmosphere is only 0.5 % of the radius — uniform sampling steps straight over it.
-- Real Rayleigh (680/550/440 nm) and Mie coefficients with per-sample sun
-  transmittance, plus a faint O I airglow band on the night limb.
+- Twenty deterministic squared-distance samples span the complete atmospheric
+  chord and cluster around closest approach, resolving dense air without adding
+  grain or increasing the march budget.
+- Rayleigh and aerosol extinction use their separate scale heights; each sample
+  includes both Sun-to-sample and sample-to-camera transmittance, plus a faint
+  ~95 km O I airglow band on the night limb.
 
 ### 2. Deep space
 
@@ -67,17 +74,36 @@ jet-stream-stretched, independently drifting.
 ### 3. Orbital-to-city navigation
 
 - Logarithmic depth buffer: 13 380 km down to 50 km with no clipping or z-fighting.
-- Quintic-eased camera arcs to 12 hubs, with live telemetry cards.
-- Click the globe near a hub to fly there, or use the ribbon.
+- Quintic-eased camera arcs to 12 hubs, with live telemetry cards and local times
+  derived from IANA time zones (including daylight-saving changes).
+- Click the globe near a hub to fly there, or use the ribbon. Dismissing a city
+  card leaves a persistent route back to orbital view.
 
-### 4. Light and smooth
+### 4. Simulated low-Earth-orbit mission overlay
 
-- HDR render target with 4× MSAA (falls back to FXAA when the GPU can't do
-  multisampled half-float).
-- Adaptive resolution: drops pixel ratio when the frame budget slips, recovers
-  when there is headroom. `?msaa=0` forces the FXAA path.
-- Shaders are precompiled during the loader, so the first frame after load is
-  already smooth.
+- A deterministic, ISS-class circular orbit at 420 km altitude and 51.6° inclination,
+  calculated from the standard Earth gravitational parameter. Its period and speed
+  are derived from the same orbital model.
+- A moving satellite marker, orbital path, Earth-fixed ground point, changing
+  latitude/longitude, orbit phase, and a simplified cylindrical Earth-shadow status.
+- Adjust simulation time from paused to 240× in Studio, hide/show the overlay, or
+  have the camera follow the marker. The ground point accounts for the rotating
+  Earth, not just the orbital plane.
+- This is an educational visualization, **not live spacecraft telemetry**. The
+  orbit uses Earth-normalized scale; its billboard marker is enlarged for legibility.
+  Orbit time warp is independent of the globe's visual spin. No satellite feed or
+  external tracking service is queried.
+
+### 5. Rendering budget and quality
+
+- HDR render target with 4× MSAA on eligible small desktop buffers; constrained,
+  high-DPR and large-buffer cases use FXAA. `?msaa=0` forces the FXAA path.
+- Adaptive resolution lowers the pixel ratio when measured frame time falls behind
+  the display's observed refresh rate, and recovers when headroom returns.
+- Shaders are compiled during the loader to avoid first-use shader compilation in
+  the active scene. This does not imply a particular device frame rate.
+- The Studio panel is code-split and fetched only when opened; its controls do
+  not add to the initial JavaScript request.
 
 ---
 
@@ -115,13 +141,17 @@ visible from 50 km.
 ### Verification
 
 ```bash
-npm run check:shaders
+npm run check
 ```
 
-Composes every shader the way the app does, resolves three's `#include` chunks,
-parses and validates each stage with [naga](https://github.com/gfx-rs/wgpu) (the wgpu
-shader compiler), and cross-checks that every uniform a shader declares is actually
-supplied by the JavaScript. It runs without a GPU, so it works in CI.
+Runs shader/compiler and uniform-contract checks, static JavaScript runtime
+checks, city-directory/time-zone invariants, LEO orbit geometry, and DPR-aware
+post-processing sizing tests. The shader check composes each
+program the way the app does, resolves Three.js `#include` chunks, parses and
+validates each stage with [naga](https://github.com/gfx-rs/wgpu) (the wgpu shader
+compiler), and cross-checks that every declared uniform is supplied by JavaScript.
+It runs without a GPU, so it works in CI. Use `npm run check:shaders` to run only
+the shader validation.
 
 ### Production
 
@@ -130,6 +160,19 @@ npm run build
 npm run preview
 ```
 
+### Performance profile
+
+```bash
+npm run profile:rendering
+```
+
+This reports asset/geometry and post-processing target memory estimates for phone,
+tablet, Retina and 1× desktop profiles. For live device measurements, open the app
+with `?profile=1`: the HUD shows RAF FPS/frame time, render calls/triangles, Three.js
+texture/geometry counts, an estimated GPU allocation, and CPU render-submit time
+(the latter is not a GPU timer). The app caps physical render pixels and reserves
+4× HDR MSAA for small, fine-pointer targets; constrained/high-DPR cases use FXAA.
+
 ---
 
 ## 🎛️ Live controls (Studio panel)
@@ -137,11 +180,14 @@ npm run preview
 | Group | Controls |
 | --- | --- |
 | Solar & Ephemeris | real-UTC sync, manual sun lat/lon, intensity |
-| Atmosphere & Scattering | Rayleigh density, city emission |
+| Atmosphere & Scattering | Rayleigh density, limb visibility, city emission |
 | Ocean & Terrain | sun glitter, sea roughness, wave detail, terrain detail, relief |
-| Cloud Decks | zonal drift, density, cumulus relief |
-| Orbital Dynamics | auto-spin, spin velocity |
+| Cloud Decks | zonal drift, density, relief, microdetail, night-flash intensity, main/high-layer visibility |
+| Orbital Dynamics | auto-spin, spin velocity, simulated LEO visibility, 0–240× orbit time warp |
 | Optics & Post | exposure, bloom strength/radius/threshold, stars, Milky Way |
+
+The satellite icon in the upper-right opens its telemetry panel. Its **Track Satellite**
+button follows the illustrative marker and yields cleanly to city flights and orbit reset.
 
 ---
 

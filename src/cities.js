@@ -13,8 +13,7 @@ import * as THREE from 'three';
  * @property {number} altitude
  * @property {string} population
  * @property {string} elevation
- * @property {string} timezone
- * @property {number} utcOffset
+ * @property {string} timeZone IANA time-zone identifier
  * @property {string} sector
  * @property {string} sectorAr
  * @property {string} description
@@ -35,8 +34,7 @@ export const CITIES = Object.freeze([
     altitude: 1.026,
     population: '22.1M',
     elevation: '23 m',
-    timezone: 'UTC+2',
-    utcOffset: 2,
+    timeZone: 'Africa/Cairo',
     sector: 'North Africa & Middle East',
     sectorAr: 'شمال أفريقيا والشرق الأوسط',
     description: 'Metropolitan hub of the Nile delta; historic center of trade with ancient and modern infrastructural nodes.',
@@ -54,8 +52,7 @@ export const CITIES = Object.freeze([
     altitude: 1.028,
     population: '7.8M',
     elevation: '612 m',
-    timezone: 'UTC+3',
-    utcOffset: 3,
+    timeZone: 'Asia/Riyadh',
     sector: 'Arabian Peninsula',
     sectorAr: 'شبه الجزيرة العربية',
     description: 'High-altitude desert metropolis; premier financial and cultural center of the Arabian Peninsula.',
@@ -73,8 +70,7 @@ export const CITIES = Object.freeze([
     altitude: 1.024,
     population: '3.6M',
     elevation: '5 m',
-    timezone: 'UTC+4',
-    utcOffset: 4,
+    timeZone: 'Asia/Dubai',
     sector: 'Persian Gulf Global Hub',
     sectorAr: 'الخليج العربي ومركز الطيران العالمي',
     description: 'Global aviation and maritime nexus; renowned for architectural superstructures and coastal infrastructure.',
@@ -92,8 +88,7 @@ export const CITIES = Object.freeze([
     altitude: 1.026,
     population: '37.4M',
     elevation: '40 m',
-    timezone: 'UTC+9',
-    utcOffset: 9,
+    timeZone: 'Asia/Tokyo',
     sector: 'East Asia Mega-Metropolis',
     sectorAr: 'شرق آسيا وأكبر مجمع حضري في العالم',
     description: 'The world’s most populous metropolitan area; cutting-edge technological and economic epicenter.',
@@ -111,8 +106,7 @@ export const CITIES = Object.freeze([
     altitude: 1.025,
     population: '19.8M',
     elevation: '10 m',
-    timezone: 'UTC-5',
-    utcOffset: -5,
+    timeZone: 'America/New_York',
     sector: 'North American Atlantic Gateway',
     sectorAr: 'الساحل الشرقي لأمريكا الشمالية',
     description: 'Global financial capital and coastal metropolis flanked by the Hudson and East rivers.',
@@ -130,8 +124,7 @@ export const CITIES = Object.freeze([
     altitude: 1.025,
     population: '9.7M',
     elevation: '11 m',
-    timezone: 'UTC+0',
-    utcOffset: 0,
+    timeZone: 'Europe/London',
     sector: 'Western Europe Financial Nexus',
     sectorAr: 'غرب أوروبا والمركز المالي العالمي',
     description: 'Historic settlement on the River Thames; primary European hub for global commerce and international transit.',
@@ -149,8 +142,7 @@ export const CITIES = Object.freeze([
     altitude: 1.025,
     population: '11.2M',
     elevation: '35 m',
-    timezone: 'UTC+1',
-    utcOffset: 1,
+    timeZone: 'Europe/Paris',
     sector: 'Western Europe Cultural Hub',
     sectorAr: 'غرب أوروبا وعاصمة الثقافة والعلوم',
     description: 'Circular planned metropolis straddling the Seine river basin; central node of Western European rail and road networks.',
@@ -168,8 +160,7 @@ export const CITIES = Object.freeze([
     altitude: 1.022,
     population: '5.9M',
     elevation: '15 m',
-    timezone: 'UTC+8',
-    utcOffset: 8,
+    timeZone: 'Asia/Singapore',
     sector: 'Strait of Malacca Maritime Chokepoint',
     sectorAr: 'مضيق ملقا وأهم ممر ملاحي في آسيا',
     description: 'Island city-state at the southern tip of the Malay Peninsula; one of the busiest maritime transshipment ports on Earth.',
@@ -187,8 +178,7 @@ export const CITIES = Object.freeze([
     altitude: 1.026,
     population: '28.5M',
     elevation: '4 m',
-    timezone: 'UTC+8',
-    utcOffset: 8,
+    timeZone: 'Asia/Shanghai',
     sector: 'Yangtze River Delta Maritime Port',
     sectorAr: 'دلتا نهر اليانغتسي والعملاق الصناعي',
     description: 'Massive coastal metropolis and world’s busiest container port on the East China Sea.',
@@ -206,8 +196,7 @@ export const CITIES = Object.freeze([
     altitude: 1.026,
     population: '12.5M',
     elevation: '71 m',
-    timezone: 'UTC-8',
-    utcOffset: -8,
+    timeZone: 'America/Los_Angeles',
     sector: 'Pacific Rim Gateway',
     sectorAr: 'الساحل الغربي وحوض المحيط الهادئ',
     description: 'Expansive coastal basin bounded by the San Gabriel Mountains and the Pacific Ocean.',
@@ -225,8 +214,7 @@ export const CITIES = Object.freeze([
     altitude: 1.025,
     population: '13.6M',
     elevation: '2 m',
-    timezone: 'UTC-3',
-    utcOffset: -3,
+    timeZone: 'America/Sao_Paulo',
     sector: 'South Atlantic Coastal Hub',
     sectorAr: 'ساحل المحيط الأطلسي الجنوبي',
     description: 'Dramatic coastal topography nestled between Guanabara Bay and steep Atlantic rainforest granite peaks.',
@@ -244,8 +232,7 @@ export const CITIES = Object.freeze([
     altitude: 1.025,
     population: '4.8M',
     elevation: '25 m',
-    timezone: 'UTC+2',
-    utcOffset: 2,
+    timeZone: 'Africa/Johannesburg',
     sector: 'Cape of Good Hope Maritime Route',
     sectorAr: 'رأس الرجاء الصالح والمحيطين',
     description: 'Iconic coastal city situated at the convergence of the Atlantic and Indian oceans beneath Table Mountain.',
@@ -255,19 +242,26 @@ export const CITIES = Object.freeze([
 ]);
 
 /**
- * Calculates current local time string for a given city based on its UTC offset
+ * Formats the current time in a city's IANA time zone. Unlike a stored UTC
+ * offset, the zone database accounts for daylight-saving rules and fractional
+ * offsets, which change by date and jurisdiction.
  * @param {CityData} city
  * @param {Date} [now]
- * @returns {string} e.g. "03:45 AM"
+ * @returns {string} e.g. "8:36 PM GMT+3"
  */
-export function getCityLocalTime(city, now = new Date()) {
-  const utcHours = now.getUTCHours();
-  const utcMinutes = now.getUTCMinutes();
-  let localHour = (utcHours + city.utcOffset) % 24;
-  if (localHour < 0) localHour += 24;
+const localTimeFormatters = new Map();
 
-  const ampm = localHour >= 12 ? 'PM' : 'AM';
-  const displayHour = localHour % 12 || 12;
-  const displayMinutes = String(utcMinutes).padStart(2, '0');
-  return `${displayHour}:${displayMinutes} ${ampm}`;
+export function getCityLocalTime(city, now = new Date()) {
+  let formatter = localTimeFormatters.get(city.timeZone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: city.timeZone,
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+      timeZoneName: 'shortOffset',
+    });
+    localTimeFormatters.set(city.timeZone, formatter);
+  }
+  return formatter.format(now);
 }
